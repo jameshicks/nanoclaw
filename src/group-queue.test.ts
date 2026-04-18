@@ -481,4 +481,34 @@ describe('GroupQueue', () => {
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  it('sendMessage calls resetTimeout so inbound messages keep the container alive', async () => {
+    let resolveProcess: () => void;
+
+    const processMessages = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveProcess = resolve;
+      });
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const resetTimeout = vi.fn();
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-1',
+      'test-group',
+      resetTimeout,
+    );
+
+    queue.sendMessage('group1@g.us', 'hello');
+    expect(resetTimeout).toHaveBeenCalledTimes(1);
+
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
 });

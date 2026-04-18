@@ -25,6 +25,7 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  resetTimeout: (() => void) | null;
 }
 
 export class GroupQueue {
@@ -49,6 +50,7 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        resetTimeout: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -134,11 +136,13 @@ export class GroupQueue {
     proc: ChildProcess,
     containerName: string,
     groupFolder?: string,
+    resetTimeout?: () => void,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+    state.resetTimeout = resetTimeout ?? null;
   }
 
   /**
@@ -171,6 +175,10 @@ export class GroupQueue {
       const tempPath = `${filepath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
       fs.renameSync(tempPath, filepath);
+      // Inbound work resets the container's hard-kill timer. Without this,
+      // a message arriving late in the idle window can be killed mid-turn
+      // before the agent produces its final stdout result.
+      state.resetTimeout?.();
       return true;
     } catch {
       return false;
@@ -226,6 +234,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.resetTimeout = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -255,6 +264,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.resetTimeout = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
