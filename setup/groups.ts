@@ -106,12 +106,18 @@ async function syncGroups(projectRoot: string): Promise<void> {
     process.exit(1);
   }
 
-  // Run sync script via a temp file to avoid shell escaping issues with node -e
+  // Run sync script via a temp .ts file executed with tsx
   logger.info('Fetching group metadata');
   let syncOk = false;
   try {
     const syncScript = `
-import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers } from '@whiskeysockets/baileys';
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  Browsers,
+  fetchLatestWaWebVersion,
+} from '@whiskeysockets/baileys';
 import pino from 'pino';
 import path from 'path';
 import fs from 'fs';
@@ -135,8 +141,10 @@ const upsert = db.prepare(
 );
 
 const { state, saveCreds } = await useMultiFileAuthState(authDir);
+const { version } = await fetchLatestWaWebVersion({}).catch(() => ({ version: undefined }));
 
 const sock = makeWASocket({
+  version,
   auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
   printQRInTerminal: false,
   logger,
@@ -163,7 +171,7 @@ sock.ev.on('connection.update', async (update) => {
         }
       }
       console.log('SYNCED:' + count);
-    } catch (err) {
+    } catch (err: any) {
       console.error('FETCH_ERROR:' + err.message);
     } finally {
       clearTimeout(timeout);
@@ -173,19 +181,20 @@ sock.ev.on('connection.update', async (update) => {
     }
   } else if (update.connection === 'close') {
     clearTimeout(timeout);
-    console.error('CONNECTION_CLOSED');
+    const reason = (update as any).lastDisconnect?.error?.output?.statusCode;
+    console.error('CONNECTION_CLOSED:' + (reason || 'unknown'));
     process.exit(1);
   }
 });
 `;
 
-    const tmpScript = path.join(projectRoot, '.tmp-group-sync.mjs');
+    const tmpScript = path.join(projectRoot, '.tmp-group-sync.ts');
     fs.writeFileSync(tmpScript, syncScript, 'utf-8');
     try {
-      const output = execSync(`node ${tmpScript}`, {
+      const output = execSync(`npx tsx ${tmpScript}`, {
         cwd: projectRoot,
         encoding: 'utf-8',
-        timeout: 45000,
+        timeout: 60000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       syncOk = output.includes('SYNCED:');
