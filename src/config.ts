@@ -5,7 +5,12 @@ import { readEnvFile } from './env.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ONECLI_URL', 'TZ']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ONECLI_URL',
+  'TZ',
+  'EYES_REACTION_FOLDERS',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -71,6 +76,15 @@ export function getTriggerPattern(trigger?: string): RegExp {
 }
 
 export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
+
+// Groups listed here get a 👀 reaction on every inbound message (read receipt).
+// The agent still runs and replies as normal. Comma-separated folder names.
+export const EYES_REACTION_FOLDERS = new Set(
+  (process.env.EYES_REACTION_FOLDERS || envConfig.EYES_REACTION_FOLDERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

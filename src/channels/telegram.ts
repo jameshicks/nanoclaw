@@ -4,7 +4,11 @@ import path from 'path';
 
 import { Api, Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import {
+  ASSISTANT_NAME,
+  EYES_REACTION_FOLDERS,
+  TRIGGER_PATTERN,
+} from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
@@ -90,7 +94,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -102,6 +109,23 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       logger.error({ fileId, err }, 'Failed to download Telegram file');
       return null;
+    }
+  }
+
+  private async reactWithEyes(
+    chatId: number,
+    messageId: number,
+  ): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.api.setMessageReaction(chatId, messageId, [
+        { type: 'emoji', emoji: '👀' },
+      ]);
+    } catch (err) {
+      logger.debug(
+        { chatId, messageId, err },
+        'Failed to set Telegram reaction',
+      );
     }
   }
 
@@ -211,6 +235,10 @@ export class TelegramChannel implements Channel {
         return;
       }
 
+      if (EYES_REACTION_FOLDERS.has(group.folder)) {
+        this.reactWithEyes(ctx.chat.id, ctx.message.message_id);
+      }
+
       // Deliver message — startMessageLoop() will pick it up
       this.opts.onMessage(chatJid, {
         id: msgId,
@@ -241,6 +269,10 @@ export class TelegramChannel implements Channel {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
+
+      if (EYES_REACTION_FOLDERS.has(group.folder)) {
+        this.reactWithEyes(ctx.chat.id, ctx.message.message_id);
+      }
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
