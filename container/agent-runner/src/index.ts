@@ -21,6 +21,8 @@ import {
   query,
   HookCallback,
   PreCompactHookInput,
+  PreToolUseHookInput,
+  PostToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -203,6 +205,84 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       );
     }
 
+    return {};
+  };
+}
+
+const TOOL_CALL_LOG_PATH = '/workspace/group/logs/tool-calls.jsonl';
+const toolCallStarts = new Map<string, number>();
+
+function appendToolCallLog(entry: Record<string, unknown>): void {
+  try {
+    fs.mkdirSync(path.dirname(TOOL_CALL_LOG_PATH), { recursive: true });
+    fs.appendFileSync(TOOL_CALL_LOG_PATH, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    log(
+      `Failed to write tool call log: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function createPreToolUseLogger(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const pre = input as PreToolUseHookInput;
+    if (pre.tool_use_id) {
+      toolCallStarts.set(pre.tool_use_id, Date.now());
+    }
+    return {};
+  };
+}
+
+function extractErrorFromResponse(
+  response: unknown,
+): { isError: boolean; error?: string } {
+  if (response && typeof response === 'object') {
+    const r = response as Record<string, unknown>;
+    if (r.is_error === true) {
+      const content = r.content;
+      let error: string | undefined;
+      if (typeof content === 'string') {
+        error = content;
+      } else if (Array.isArray(content)) {
+        error = content
+          .map((c) =>
+            c && typeof c === 'object' && 'text' in c
+              ? String((c as { text: unknown }).text)
+              : JSON.stringify(c),
+          )
+          .join('\n');
+      } else if (content !== undefined) {
+        error = JSON.stringify(content);
+      }
+      return { isError: true, error };
+    }
+  }
+  return { isError: false };
+}
+
+function createPostToolUseLogger(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const post = input as PostToolUseHookInput;
+    const startedAt = post.tool_use_id
+      ? toolCallStarts.get(post.tool_use_id)
+      : undefined;
+    if (post.tool_use_id) {
+      toolCallStarts.delete(post.tool_use_id);
+    }
+    const now = Date.now();
+    const { isError, error } = extractErrorFromResponse(post.tool_response);
+    appendToolCallLog({
+      ts: new Date(now).toISOString(),
+      session_id: post.session_id,
+      tool_use_id: post.tool_use_id,
+      tool_name: post.tool_name,
+      tool_input: post.tool_input,
+      duration_ms: startedAt !== undefined ? now - startedAt : null,
+      status: isError ? 'error' : 'success',
+      error,
+      agent_id: post.agent_id,
+      agent_type: post.agent_type,
+    });
     return {};
   };
 }
@@ -469,6 +549,7 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        'mcp__custom__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -484,11 +565,17 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        custom: {
+          type: 'http',
+          url: 'http://host.docker.internal:8765/mcp',
+        },
       },
       hooks: {
         PreCompact: [
           { hooks: [createPreCompactHook(containerInput.assistantName)] },
         ],
+        PreToolUse: [{ hooks: [createPreToolUseLogger()] }],
+        PostToolUse: [{ hooks: [createPostToolUseLogger()] }],
       },
     },
   })) {
