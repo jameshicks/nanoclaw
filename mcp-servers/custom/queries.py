@@ -233,10 +233,11 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
 # -------- Entity fetch --------
 
 
-def get_artist(conn, artist_id: int) -> Optional[dict]:
+def get_artist(conn, artist_id: int, compact: bool = False) -> Optional[dict]:
     cur = conn.cursor()
+    cols = "id, name, realname, data_quality" if compact else "id, name, realname, profile, data_quality"
     cur.execute(
-        "SELECT id, name, realname, profile, data_quality FROM artist WHERE id = ?",
+        f"SELECT {cols} FROM artist WHERE id = ?",
         [artist_id],
     )
     artist = _one(cur)
@@ -676,6 +677,7 @@ def find_collaborators(
     depth: int,
     min_shared_releases: int,
     roles: Optional[Any] = None,
+    include_top_shared_titles: bool = True,
 ) -> list[dict]:
     depth = _clamp(depth, 1, 3)
     min_shared = max(1, int(min_shared_releases))
@@ -739,7 +741,7 @@ def find_collaborators(
         # level. Group by title (not release_id) to dedupe across pressings/editions —
         # e.g. "Press Color" on US + UK + France collapses to one entry. Ordered by
         # earliest-known year so the titles make a rough timeline.
-        if level_neighbor_ids:
+        if level_neighbor_ids and include_top_shared_titles:
             cur.execute(
                 f"""
                 WITH edges AS (
@@ -785,7 +787,28 @@ def find_collaborators(
         r["top_shared_titles"] = titles_by_neighbor.get(r["artist_id"], [])
 
     results.sort(key=lambda r: (r["distance"], -r["shared_releases"]))
-    return results[:500]
+    results = results[:500]
+
+    if results:
+        neighbor_ids = [r["artist_id"] for r in results]
+        cur.execute(
+            """
+            SELECT artist_id, alias_artist_id, alias_name
+              FROM artist_alias
+             WHERE artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+             ORDER BY artist_id, alias_name
+            """,
+            [neighbor_ids],
+        )
+        aliases_by_artist: dict[int, list[dict]] = {}
+        for aid, alias_id, alias_name in cur.fetchall():
+            aliases_by_artist.setdefault(aid, []).append(
+                {"id": alias_id, "name": alias_name}
+            )
+        for r in results:
+            r["aliases"] = aliases_by_artist.get(r["artist_id"], [])
+
+    return results
 
 
 def find_path_between_artists(

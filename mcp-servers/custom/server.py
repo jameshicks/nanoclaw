@@ -202,10 +202,13 @@ def search_label(name: str, limit: int = 10) -> list[dict]:
 
 @mcp.tool
 @_log_call
-def get_artist(artist_id: int) -> Optional[dict]:
+def get_artist(artist_id: int, compact: bool = False) -> Optional[dict]:
     """Full artist record: core fields plus aliases, name variations, URLs,
-    groups the artist is a member of, and members (if this artist is a group)."""
-    return Q.get_artist(_CONN, int(artist_id))
+    groups the artist is a member of, and members (if this artist is a group).
+    `compact=True` omits the `profile` field (the free-form bio, often the
+    largest part of the response) — use for overview scans when you only need
+    structured fields."""
+    return Q.get_artist(_CONN, int(artist_id), bool(compact))
 
 
 @mcp.tool
@@ -294,25 +297,36 @@ def find_collaborators(
     depth: int = 1,
     min_shared_releases: int = 1,
     roles: Optional[list[str]] = None,
+    include_top_shared_titles: bool = True,
 ) -> list[dict]:
     """BFS over the collaboration graph. Edges go from an artist's own releases
     (they are primary, extra=0) to anyone else credited on those releases
     (primary or additional). `depth` hard-capped at 3. `min_shared_releases`
     gates weak edges. `roles` filters the neighbor side: accepts a list of
     aliases or arbitrary substrings — any match qualifies. Aliases:
-    "musical" (broad blocklist excluding photography/design/liner-notes/A&R
-    etc. — the common ask for "who played on the records"); "performer"
-    (strictly primary-credited, no role string); "producer"; "writer";
-    "engineer". Each result includes `top_shared_titles` (up to 3 release
-    titles this artist shares with the seed side, deduped across pressings),
-    so you can judge the relationship without a follow-up query. Sorted by
-    (distance asc, shared_releases desc). Capped at 500 rows."""
+    "musical" — the common "who played on the records" filter. Keeps rows
+    with NULL/empty role (performers) plus anything whose role does NOT
+    match these substrings: Photograph, Design, Artwork, Illustration,
+    Sleeve, Layout, Cover, Liner Notes, Translation, Translator, Management,
+    Manager, A&R, Legal, Booking, Coordinator, Executive, Supervisor.
+    "performer" (strictly primary-credited, no role string); "producer";
+    "writer"; "engineer". Each result includes `top_shared_titles` (up to 3
+    release titles this artist shares with the seed side, deduped across
+    pressings) and `aliases` (list of `{id, name}` for this artist's
+    known alter-egos — useful for spotting when e.g. "JG Thirlwell" and
+    "Clint Ruin" are the same person split across rows). Sorted by
+    (distance asc, shared_releases desc). Capped at 500 rows.
+    `include_top_shared_titles=False` skips the title lookup and returns
+    empty lists — use for overview scans when titles will exhaust context;
+    call again with True on a narrower artist set once you know who to focus
+    on."""
     return Q.find_collaborators(
         _CONN,
         int(artist_id),
         int(depth),
         int(min_shared_releases),
         roles,
+        bool(include_top_shared_titles),
     )
 
 
