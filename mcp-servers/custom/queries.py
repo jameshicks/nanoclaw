@@ -513,6 +513,70 @@ def get_artist_discography(
     return _rows(cur)
 
 
+def get_label_releases(
+    conn,
+    label_id: int,
+    year_range: Optional[tuple[int, int]],
+    unique_masters_only: bool = True,
+) -> list[dict]:
+    clauses = ["rl.label_id = ?"]
+    params: list[Any] = [label_id]
+    if year_range is not None:
+        lo, hi = year_range
+        clauses.append("r.released_year BETWEEN ? AND ?")
+        params.extend([int(lo), int(hi)])
+    where = " AND ".join(clauses)
+    cur = conn.cursor()
+
+    if unique_masters_only:
+        cur.execute(
+            f"""
+            WITH releases AS (
+              SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                     FIRST(rl.catno) AS catno
+                FROM release_label rl
+                JOIN release r ON r.id = rl.release_id
+               WHERE {where}
+               GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+            ),
+            deduped AS (
+              SELECT *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(master_id, -id)
+                       ORDER BY year NULLS LAST, id
+                     ) AS _rank,
+                     COUNT(*) OVER (PARTITION BY COALESCE(master_id, -id)) AS pressings_count
+                FROM releases
+            )
+            SELECT id, title, year, country, master_id, catno, pressings_count,
+                   (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
+                      FROM release_artist ra WHERE ra.release_id = deduped.id AND ra.extra = 0) AS primary_artists
+              FROM deduped
+             WHERE _rank = 1
+             ORDER BY year NULLS LAST, title
+             LIMIT 500
+            """,
+            params,
+        )
+    else:
+        cur.execute(
+            f"""
+            SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                   FIRST(rl.catno) AS catno,
+                   (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
+                      FROM release_artist ra WHERE ra.release_id = r.id AND ra.extra = 0) AS primary_artists
+              FROM release_label rl
+              JOIN release r ON r.id = rl.release_id
+             WHERE {where}
+             GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+             ORDER BY year NULLS LAST, r.title
+             LIMIT 500
+            """,
+            params,
+        )
+    return _rows(cur)
+
+
 def get_label_roster(
     conn,
     label_id: int,

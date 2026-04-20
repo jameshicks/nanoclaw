@@ -1,4 +1,4 @@
-"""Discogs DuckDB MCP server. Exposes 14 tools over FastMCP HTTP on port 8765.
+"""Discogs DuckDB MCP server. Exposes 15 tools over FastMCP HTTP on port 8765.
 
 Expects a read-only DuckDB file at /data/discogs.duckdb (override with DISCOGS_DB_PATH)
 with FTS indexes already built via setup_fts.py. Fails fast at import if either is missing.
@@ -152,6 +152,28 @@ def get_artist_discography(
 
 @mcp.tool
 @_log_call
+def get_label_releases(
+    label_id: int,
+    year_range: Optional[list[int]] = None,
+    unique_masters_only: bool = True,
+) -> list[dict]:
+    """Releases issued on this label. Each row: id, title, year, country,
+    master_id, catno (Discogs catalog number), primary_artists, pressings_count.
+    `year_range=[lo, hi]` filters on released_year (NULLs excluded).
+    `unique_masters_only=True` (default) collapses pressings/editions to one
+    row per Discogs master — essential for label narratives since labels
+    re-press and re-release heavily across territories. Capped at 500 rows.
+    For roster-level aggregates use `get_label_roster` instead."""
+    return Q.get_label_releases(
+        _CONN,
+        int(label_id),
+        _year_range(year_range),
+        bool(unique_masters_only),
+    )
+
+
+@mcp.tool
+@_log_call
 def get_label_roster(
     label_id: int,
     year_range: Optional[list[int]] = None,
@@ -274,7 +296,8 @@ Unofficial marker and are bootlegs.
 
 - "who is X? what did they release?" → `search_artist` → `get_artist_discography`
 - "tell me about this record" → `search_release` → `get_release`
-- "what does this label put out?" → `search_label` → `get_label_roster`
+- "what does this label put out?" → `search_label` → `get_label_releases` (titles) or
+  `get_label_roster` (artists + counts)
 - "who has X worked with?" → `find_collaborators`
 - "are X and Y connected via collaborators?" → `find_path_between_artists`
 - "snapshot of a scene" (by label, year, country) → `get_scene_snapshot`
