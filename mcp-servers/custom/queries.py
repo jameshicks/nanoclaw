@@ -369,6 +369,7 @@ _NON_MUSICAL_PATTERNS = (
     "%Translation%",
     "%Translator%",
     "%Management%",
+    "%Manager%",
     "%A&R%",
     "%Legal%",
     "%Booking%",
