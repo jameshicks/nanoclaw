@@ -44,11 +44,17 @@ docker build -t nanoclaw-discogs-mcp mcp-servers/custom
 docker run -d --name nanoclaw-discogs-mcp \
   --restart=unless-stopped \
   -v ~/projects/discogs_db:/data:ro \
+  -v ~/discogs-mcp-logs:/logs \
   -p 8765:8765 \
   nanoclaw-discogs-mcp
 
 docker logs -f nanoclaw-discogs-mcp
 ```
+
+Per-tool-invocation query logs are appended to `~/discogs-mcp-logs/queries.jsonl`
+(one JSON object per line: `ts`, `tool`, `args`, `queries`, `row_count`,
+`duration_ms`, `status`, `error`). Override the in-container path with
+`QUERY_LOG_PATH` if you need it somewhere else.
 
 On Linux the agent container reaches the host via `host.docker.internal` because
 `src/container-runtime.ts` passes `--add-host=host.docker.internal:host-gateway`. No

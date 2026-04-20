@@ -4,10 +4,13 @@ Expects a read-only DuckDB file at /data/discogs.duckdb (override with DISCOGS_D
 with FTS indexes already built via setup_fts.py. Fails fast at import if either is missing.
 """
 
+import contextvars
+import datetime as _dt
 import functools
 import json
 import os
 import sys
+import threading
 import time
 from typing import Any, Optional
 
@@ -16,6 +19,85 @@ from fastmcp import FastMCP
 
 import queries as Q
 import sql_guard
+
+
+QUERY_LOG_PATH = os.environ.get("QUERY_LOG_PATH", "/logs/queries.jsonl")
+_sql_capture: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "sql_capture", default=None
+)
+_log_write_lock = threading.Lock()
+
+
+def _append_query_log(entry: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(QUERY_LOG_PATH), exist_ok=True)
+        line = json.dumps(entry, default=str) + "\n"
+        with _log_write_lock:
+            with open(QUERY_LOG_PATH, "a") as f:
+                f.write(line)
+    except Exception as e:
+        print(f"[query-log] failed to write: {e!r}", file=sys.stderr, flush=True)
+
+
+def _capture_execute(real_execute, sql, args, kwargs):
+    """Run real_execute while recording SQL into the active capture buffer, if any."""
+    buf = _sql_capture.get()
+    if buf is None:
+        return real_execute(sql, *args, **kwargs)
+    start = time.time()
+    params = args[0] if args else kwargs.get("parameters")
+    try:
+        cur = real_execute(sql, *args, **kwargs)
+        buf.append(
+            {
+                "sql": sql,
+                "params": params,
+                "duration_ms": int((time.time() - start) * 1000),
+            }
+        )
+        return cur
+    except Exception as e:
+        buf.append(
+            {
+                "sql": sql,
+                "params": params,
+                "duration_ms": int((time.time() - start) * 1000),
+                "error": repr(e),
+            }
+        )
+        raise
+
+
+class _CursorProxy:
+    """Proxies a DuckDB cursor so execute() calls are captured."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, *args, **kwargs):
+        return _capture_execute(self._cur.execute, sql, args, kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class _ConnProxy:
+    """Proxies a DuckDB connection so execute()/cursor().execute() are captured."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args, **kwargs):
+        return _capture_execute(self._conn.execute, sql, args, kwargs)
+
+    def cursor(self):
+        return _CursorProxy(self._conn.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 def _log_call(fn):
@@ -27,14 +109,33 @@ def _log_call(fn):
             compact = json.dumps(payload, default=str)[:300]
         except Exception:
             compact = repr(payload)[:300]
+        sqls: list = []
+        token = _sql_capture.set(sqls)
+        error: Optional[str] = None
+        size: Any = None
         try:
             result = fn(*args, **kwargs)
             size = len(result) if isinstance(result, list) else (len(result) if isinstance(result, (str, bytes)) else 1)
             print(f"[tool] {fn.__name__} {compact} -> {size} rows in {time.time() - start:.2f}s", flush=True)
             return result
         except Exception as e:
-            print(f"[tool] {fn.__name__} {compact} -> ERROR {e!r} in {time.time() - start:.2f}s", flush=True)
+            error = repr(e)
+            print(f"[tool] {fn.__name__} {compact} -> ERROR {error} in {time.time() - start:.2f}s", flush=True)
             raise
+        finally:
+            _sql_capture.reset(token)
+            _append_query_log(
+                {
+                    "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    "tool": fn.__name__,
+                    "args": payload,
+                    "queries": sqls,
+                    "row_count": size,
+                    "duration_ms": int((time.time() - start) * 1000),
+                    "status": "error" if error else "success",
+                    "error": error,
+                }
+            )
 
     return wrap
 
@@ -54,6 +155,8 @@ except Exception as e:
 
 _CONN.execute("SET memory_limit='8GB'")
 _CONN.execute("SET threads=4")
+
+_CONN = _ConnProxy(_CONN)
 
 
 def _year_range(v: Any) -> Optional[tuple[int, int]]:

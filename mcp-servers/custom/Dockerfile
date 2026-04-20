@@ -12,7 +12,7 @@ RUN python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL fts'); c
 
 COPY server.py queries.py sql_guard.py ./
 
-VOLUME ["/data"]
+VOLUME ["/data", "/logs"]
 
 EXPOSE 8765
 
