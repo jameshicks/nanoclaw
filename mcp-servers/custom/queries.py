@@ -368,6 +368,7 @@ def get_artist_discography(
     role: Optional[str],
     as_main_only: bool,
     year_range: Optional[tuple[int, int]],
+    unique_masters_only: bool = True,
 ) -> list[dict]:
     clauses = ["ra.artist_id = ?"]
     params: list[Any] = [artist_id]
@@ -390,24 +391,58 @@ def get_artist_discography(
 
     where = " AND ".join(clauses)
     cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT DISTINCT
-               r.id, r.title, r.released_year AS year, r.country,
-               r.master_id,
-               FIRST(ra.role) AS role,
-               FIRST(ra.extra) AS extra,
-               (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                  FROM release_label rl WHERE rl.release_id = r.id) AS labels
-          FROM release_artist ra
-          JOIN release r ON r.id = ra.release_id
-         WHERE {where}
-         GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
-         ORDER BY year NULLS LAST, r.title
-         LIMIT 500
-        """,
-        params,
-    )
+
+    if unique_masters_only:
+        # Collapse to one row per master (earliest-year, lowest-id pressing).
+        # Standalone releases (master_id IS NULL) keyed by -id — Discogs IDs
+        # are strictly positive so there's no collision with real master_ids.
+        cur.execute(
+            f"""
+            WITH releases AS (
+              SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                     FIRST(ra.role) AS role,
+                     FIRST(ra.extra) AS extra
+                FROM release_artist ra
+                JOIN release r ON r.id = ra.release_id
+               WHERE {where}
+               GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+            ),
+            deduped AS (
+              SELECT *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(master_id, -id)
+                       ORDER BY year NULLS LAST, id
+                     ) AS _rank,
+                     COUNT(*) OVER (PARTITION BY COALESCE(master_id, -id)) AS pressings_count
+                FROM releases
+            )
+            SELECT id, title, year, country, master_id, role, extra, pressings_count,
+                   (SELECT STRING_AGG(DISTINCT label_name, '; ')
+                      FROM release_label rl WHERE rl.release_id = deduped.id) AS labels
+              FROM deduped
+             WHERE _rank = 1
+             ORDER BY year NULLS LAST, title
+             LIMIT 500
+            """,
+            params,
+        )
+    else:
+        cur.execute(
+            f"""
+            SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                   FIRST(ra.role) AS role,
+                   FIRST(ra.extra) AS extra,
+                   (SELECT STRING_AGG(DISTINCT label_name, '; ')
+                      FROM release_label rl WHERE rl.release_id = r.id) AS labels
+              FROM release_artist ra
+              JOIN release r ON r.id = ra.release_id
+             WHERE {where}
+             GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+             ORDER BY year NULLS LAST, r.title
+             LIMIT 500
+            """,
+            params,
+        )
     return _rows(cur)
 
 

@@ -129,18 +129,24 @@ def get_artist_discography(
     role: Optional[str] = None,
     as_main_only: bool = False,
     year_range: Optional[list[int]] = None,
+    unique_masters_only: bool = True,
 ) -> list[dict]:
     """Releases crediting this artist. `role` accepts "performer" (empty role),
     "producer", "writer", "engineer" as grouped aliases; any other string is a
     substring ILIKE match against release_artist.role. `as_main_only=True`
     restricts to primary credits (extra=0). `year_range=[lo, hi]` filters on
-    released_year (releases with NULL year are excluded). Capped at 500 rows."""
+    released_year (releases with NULL year are excluded). `unique_masters_only=True`
+    (default) collapses pressings/editions to one row per Discogs master, picking
+    the earliest-year pressing; each row carries `pressings_count` for how many
+    variants it represents. Set False to see every pressing (can explode for
+    prolific artists). Capped at 500 rows."""
     return Q.get_artist_discography(
         _CONN,
         int(artist_id),
         role,
         bool(as_main_only),
         _year_range(year_range),
+        bool(unique_masters_only),
     )
 
 
