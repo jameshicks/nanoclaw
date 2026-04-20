@@ -2,6 +2,7 @@
 and returns JSON-serializable dicts/lists. No FastMCP dependencies here so this file is unit-testable
 in isolation."""
 
+import re
 from typing import Any, Iterable, Optional
 
 
@@ -20,23 +21,70 @@ def _clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
+# Name normalization for exact-match boost. Without this, BM25 ranks short
+# namesakes above the canonical entity — "Thes" beats "James White & The Blacks"
+# on "james white and the blacks" because BM25 is length-normalized, and the
+# simple LOWER(name)=LOWER(?) fallback misses "&" vs "and" differences and
+# Discogs-style "(2)" disambiguators.
+_NORM_DISAMB = re.compile(r"\(\d+\)")
+_NORM_AMP = re.compile(r"\s*&\s*")
+_NORM_PUNCT = re.compile(r"[^a-z0-9 ]+")
+_NORM_WS = re.compile(r"\s+")
+
+
+def _normalize_name(s: str) -> str:
+    s = s.lower()
+    s = _NORM_DISAMB.sub("", s)
+    s = _NORM_AMP.sub(" and ", s)
+    s = _NORM_PUNCT.sub(" ", s)
+    return _NORM_WS.sub(" ", s).strip()
+
+
+def _sql_normalize(col: str) -> str:
+    """SQL expression mirroring _normalize_name applied to a column."""
+    return (
+        "TRIM(regexp_replace("
+        f"regexp_replace("
+        f"regexp_replace("
+        f"regexp_replace(LOWER({col}), '\\(\\d+\\)', '', 'g'),"
+        f"'\\s*&\\s*', ' and ', 'g'),"
+        f"'[^a-z0-9 ]+', ' ', 'g'),"
+        f"'\\s+', ' ', 'g'))"
+    )
+
+
 # -------- Search (FTS-backed) --------
 
 
 def search_artist(conn, name: str, limit: int) -> list[dict]:
     limit = _clamp(limit, 1, 100)
-    # Pull a wider FTS candidate set, then re-rank: exact-name match wins,
-    # then BM25, with name-length as the final tiebreak. BM25 alone ranks
-    # short namesakes ("I'm Aphex Twin") above the canonical entity.
+    # Pull a wider FTS candidate set, then re-rank in three tiers:
+    #   0 — raw lowercase name matches the query verbatim (canonical entity
+    #       always wins here — "Aphex Twin" beats "Aphex Twin (69)")
+    #   1 — normalized match after stripping disambiguators, "&"/"and", punct
+    #       (bridges "James White & The Blacks" vs "James White and the Blacks")
+    #   2 — plain BM25 candidates
+    # Within each tier: BM25 score DESC, then shorter name wins.
     fts_fetch = max(limit * 5, 50)
+    norm_query = _normalize_name(name)
+    name_norm_sql = _sql_normalize("a.name")
+    hits_norm_sql = _sql_normalize("name")
+    match_tier_sql_hits = (
+        f"CASE WHEN LOWER(name) = LOWER(?) THEN 0 "
+        f"WHEN {hits_norm_sql} = ? THEN 1 ELSE 2 END"
+    )
+    match_tier_sql_out = (
+        f"CASE WHEN LOWER(a.name) = LOWER(?) THEN 0 "
+        f"WHEN {name_norm_sql} = ? THEN 1 ELSE 2 END"
+    )
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         WITH hits AS (
           SELECT id, fts_main_artist.match_bm25(id, ?) AS score
             FROM artist
            WHERE fts_main_artist.match_bm25(id, ?) IS NOT NULL
-           ORDER BY CASE WHEN LOWER(name) = LOWER(?) THEN 0 ELSE 1 END,
+           ORDER BY {match_tier_sql_hits},
                     score DESC
            LIMIT ?
         ),
@@ -77,12 +125,12 @@ def search_artist(conn, name: str, limit: int) -> list[dict]:
           JOIN artist a ON a.id = h.id
           LEFT JOIN labels l ON l.artist_id = h.id
           LEFT JOIN years y ON y.artist_id = h.id
-         ORDER BY CASE WHEN LOWER(a.name) = LOWER(?) THEN 0 ELSE 1 END,
+         ORDER BY {match_tier_sql_out},
                   h.score DESC,
                   LENGTH(a.name) ASC
          LIMIT ?
         """,
-        [name, name, name, fts_fetch, name, limit],
+        [name, name, name, norm_query, fts_fetch, name, norm_query, limit],
     )
     return _rows(cur)
 
@@ -144,14 +192,25 @@ def search_release(
 def search_label(conn, name: str, limit: int) -> list[dict]:
     limit = _clamp(limit, 1, 100)
     fts_fetch = max(limit * 5, 50)
+    norm_query = _normalize_name(name)
+    hits_norm_sql = _sql_normalize("name")
+    name_norm_sql = _sql_normalize("l.name")
+    match_tier_hits = (
+        f"CASE WHEN LOWER(name) = LOWER(?) THEN 0 "
+        f"WHEN {hits_norm_sql} = ? THEN 1 ELSE 2 END"
+    )
+    match_tier_out = (
+        f"CASE WHEN LOWER(l.name) = LOWER(?) THEN 0 "
+        f"WHEN {name_norm_sql} = ? THEN 1 ELSE 2 END"
+    )
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         WITH hits AS (
           SELECT id, fts_main_label.match_bm25(id, ?) AS score
             FROM label
            WHERE fts_main_label.match_bm25(id, ?) IS NOT NULL
-           ORDER BY CASE WHEN LOWER(name) = LOWER(?) THEN 0 ELSE 1 END,
+           ORDER BY {match_tier_hits},
                     score DESC
            LIMIT ?
         )
@@ -161,12 +220,12 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
                h.score AS bm25_score
           FROM hits h
           JOIN label l ON l.id = h.id
-         ORDER BY CASE WHEN LOWER(l.name) = LOWER(?) THEN 0 ELSE 1 END,
+         ORDER BY {match_tier_out},
                   h.score DESC,
                   LENGTH(l.name) ASC
          LIMIT ?
         """,
-        [name, name, name, fts_fetch, name, limit],
+        [name, name, name, norm_query, fts_fetch, name, norm_query, limit],
     )
     return _rows(cur)
 
