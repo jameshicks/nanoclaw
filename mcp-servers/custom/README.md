@@ -16,7 +16,7 @@ the `custom` key — no `.mcp.json` edits needed.
 | `get_label(label_id)` | Full record + parent, sublabels |
 | `get_artist_discography(artist_id, role=None, as_main_only=False, year_range=None, unique_masters_only=True)` | Role aliases: `performer`, `producer`, `writer`, `engineer`. Default collapses pressings to one row per master. |
 | `get_label_roster(label_id, year_range=None)` | Primary artists by release count |
-| `find_collaborators(artist_id, depth=1, min_shared_releases=1)` | BFS, depth ≤ 3 |
+| `find_collaborators(artist_id, depth=1, min_shared_releases=1, roles=None)` | BFS, depth ≤ 3. `roles` aliases: `musical` (blocklist), `performer`, `producer`, `writer`, `engineer`. Results include `top_shared_titles`. |
 | `find_path_between_artists(a_id, b_id, max_depth=4)` | Shortest path, max_depth ≤ 6 |
 | `get_scene_snapshot(label_ids=None, year_range=None, country=None)` | Multi-dim slice |
 | `list_compilations_featuring_artist(artist_id)` | Filtered on `release_format.descriptions` |

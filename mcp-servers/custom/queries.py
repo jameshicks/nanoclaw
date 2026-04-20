@@ -354,12 +354,80 @@ def get_label(conn, label_id: int) -> Optional[dict]:
 # -------- Traversal --------
 
 
-_ROLE_PREDICATES: dict[str, str] = {
-    "performer": "(ra.role IS NULL OR ra.role = '')",
-    "producer": "ra.role ILIKE '%Producer%'",
-    "writer": "(ra.role ILIKE '%Written-By%' OR ra.role ILIKE '%Composed By%' OR ra.role ILIKE '%Lyrics By%')",
-    "engineer": "(ra.role ILIKE '%Engineer%' OR ra.role ILIKE '%Mix%' OR ra.role ILIKE '%Mastered%')",
-}
+# Non-musical role patterns used by the "musical" alias below — package/art
+# direction and business credits that agents generally want to exclude when
+# asking "who played on this?"
+_NON_MUSICAL_PATTERNS = (
+    "%Photograph%",
+    "%Design%",
+    "%Artwork%",
+    "%Illustration%",
+    "%Sleeve%",
+    "%Layout%",
+    "%Cover %",
+    "%Liner Notes%",
+    "%Translation%",
+    "%Translator%",
+    "%Management%",
+    "%A&R%",
+    "%Legal%",
+    "%Booking%",
+    "%Coordinator%",
+    "%Executive%",
+    "%Supervisor%",
+)
+
+
+def _role_predicate(alias: str, key: str) -> tuple[str, list[Any]]:
+    """Build a SQL predicate fragment for role filtering, parameterized by table alias.
+
+    Known keys map to curated clauses; anything else becomes a substring ILIKE.
+    Returns (sql_fragment, params). Params is empty for curated clauses,
+    non-empty for the substring fallthrough or the "musical" blocklist alias."""
+    key = key.strip().lower()
+    col = f"{alias}.role"
+    if key == "performer":
+        return f"({col} IS NULL OR {col} = '')", []
+    if key == "producer":
+        return f"{col} ILIKE '%Producer%'", []
+    if key == "writer":
+        return (
+            f"({col} ILIKE '%Written-By%' OR {col} ILIKE '%Composed By%' OR {col} ILIKE '%Lyrics By%')",
+            [],
+        )
+    if key == "engineer":
+        return (
+            f"({col} ILIKE '%Engineer%' OR {col} ILIKE '%Mix%' OR {col} ILIKE '%Mastered%')",
+            [],
+        )
+    if key == "musical":
+        blocks = " AND ".join(f"{col} NOT ILIKE ?" for _ in _NON_MUSICAL_PATTERNS)
+        return f"({col} IS NULL OR ({blocks}))", list(_NON_MUSICAL_PATTERNS)
+    if key:
+        return f"{col} ILIKE ?", [f"%{key}%"]
+    return "TRUE", []
+
+
+def _roles_clause(alias: str, roles: Optional[Any]) -> tuple[Optional[str], list[Any]]:
+    """Normalize roles arg (None | str | list[str]) into an OR-combined predicate
+    against the given table alias. Returns (clause_or_None, params)."""
+    if roles is None:
+        return None, []
+    if isinstance(roles, str):
+        roles = [roles]
+    if not roles:
+        return None, []
+    frags: list[str] = []
+    params: list[Any] = []
+    for r in roles:
+        frag, fp = _role_predicate(alias, r)
+        if frag == "TRUE":
+            continue
+        frags.append(frag)
+        params.extend(fp)
+    if not frags:
+        return None, []
+    return "(" + " OR ".join(frags) + ")", params
 
 
 def get_artist_discography(
@@ -382,12 +450,10 @@ def get_artist_discography(
         params.extend([int(lo), int(hi)])
 
     if role is not None:
-        key = role.strip().lower()
-        if key in _ROLE_PREDICATES:
-            clauses.append(_ROLE_PREDICATES[key])
-        elif key:
-            clauses.append("ra.role ILIKE ?")
-            params.append(f"%{role}%")
+        frag, fp = _role_predicate("ra", role)
+        if frag != "TRUE":
+            clauses.append(frag)
+            params.extend(fp)
 
     where = " AND ".join(clauses)
     cur = conn.cursor()
@@ -485,20 +551,28 @@ def find_collaborators(
     artist_id: int,
     depth: int,
     min_shared_releases: int,
+    roles: Optional[Any] = None,
 ) -> list[dict]:
     depth = _clamp(depth, 1, 3)
     min_shared = max(1, int(min_shared_releases))
 
+    role_clause, role_params = _roles_clause("ra2", roles)
+    role_sql = f" AND {role_clause}" if role_clause else ""
+
     visited: set[int] = {artist_id}
     frontier: set[int] = {artist_id}
     results: list[dict] = []
+    # Keyed by (seed_at_this_level, neighbor) but we only surface per-neighbor titles
+    # relative to the seed artist, not the cumulative path. That means "top_shared_titles"
+    # is scoped to this BFS hop, which is the right question the agent is asking.
+    titles_by_neighbor: dict[int, list[str]] = {}
 
     cur = conn.cursor()
     for d in range(1, depth + 1):
         if not frontier:
             break
         cur.execute(
-            """
+            f"""
             SELECT ra2.artist_id, a.name,
                    COUNT(DISTINCT ra2.release_id) AS shared_releases
               FROM release_artist ra1
@@ -509,30 +583,82 @@ def find_collaborators(
              WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
                AND ra1.extra = 0
                AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+               {role_sql}
              GROUP BY ra2.artist_id, a.name
             HAVING COUNT(DISTINCT ra2.release_id) >= ?
              ORDER BY shared_releases DESC
              LIMIT 2000
             """,
-            [list(frontier), list(visited), min_shared],
+            [list(frontier), list(visited), *role_params, min_shared],
         )
         new_rows = _rows(cur)
         new_frontier: set[int] = set()
+        level_neighbor_ids: list[int] = []
         for row in new_rows:
             aid = row["artist_id"]
             if aid in visited:
                 continue
             visited.add(aid)
             new_frontier.add(aid)
+            level_neighbor_ids.append(aid)
             results.append(
                 {
                     "artist_id": aid,
                     "name": row["name"],
                     "distance": d,
                     "shared_releases": row["shared_releases"],
+                    "top_shared_titles": [],
                 }
             )
+
+        # Batch fetch top 3 distinct shared release titles for the neighbors at this
+        # level. Group by title (not release_id) to dedupe across pressings/editions —
+        # e.g. "Press Color" on US + UK + France collapses to one entry. Ordered by
+        # earliest-known year so the titles make a rough timeline.
+        if level_neighbor_ids:
+            cur.execute(
+                f"""
+                WITH edges AS (
+                  SELECT DISTINCT ra2.artist_id AS neighbor_id,
+                         r.id AS release_id, r.title, r.released_year AS year
+                    FROM release_artist ra1
+                    JOIN release_artist ra2
+                      ON ra2.release_id = ra1.release_id
+                     AND ra2.artist_id <> ra1.artist_id
+                    JOIN release r ON r.id = ra1.release_id
+                   WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                     AND ra1.extra = 0
+                     AND ra2.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                     {role_sql}
+                ),
+                titles AS (
+                  SELECT neighbor_id, title,
+                         MIN(COALESCE(year, 9999)) AS year_rank,
+                         MIN(release_id) AS id_rank
+                    FROM edges
+                   GROUP BY neighbor_id, title
+                )
+                SELECT neighbor_id, title
+                  FROM (
+                    SELECT neighbor_id, title,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY neighbor_id
+                             ORDER BY year_rank, id_rank
+                           ) AS rn
+                      FROM titles
+                  )
+                 WHERE rn <= 3
+                 ORDER BY neighbor_id, rn
+                """,
+                [list(frontier), level_neighbor_ids, *role_params],
+            )
+            for neighbor_id, title in cur.fetchall():
+                titles_by_neighbor.setdefault(neighbor_id, []).append(title)
+
         frontier = new_frontier
+
+    for r in results:
+        r["top_shared_titles"] = titles_by_neighbor.get(r["artist_id"], [])
 
     results.sort(key=lambda r: (r["distance"], -r["shared_releases"]))
     return results[:500]

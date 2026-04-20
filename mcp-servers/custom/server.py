@@ -168,17 +168,26 @@ def find_collaborators(
     artist_id: int,
     depth: int = 1,
     min_shared_releases: int = 1,
+    roles: Optional[list[str]] = None,
 ) -> list[dict]:
     """BFS over the collaboration graph. Edges go from an artist's own releases
     (they are primary, extra=0) to anyone else credited on those releases
     (primary or additional). `depth` hard-capped at 3. `min_shared_releases`
-    gates weak edges. Returns distinct artist_ids with distance and shared-release
-    count, sorted by (distance asc, shared_releases desc). Capped at 500 rows."""
+    gates weak edges. `roles` filters the neighbor side: accepts a list of
+    aliases or arbitrary substrings — any match qualifies. Aliases:
+    "musical" (broad blocklist excluding photography/design/liner-notes/A&R
+    etc. — the common ask for "who played on the records"); "performer"
+    (strictly primary-credited, no role string); "producer"; "writer";
+    "engineer". Each result includes `top_shared_titles` (up to 3 release
+    titles this artist shares with the seed side, deduped across pressings),
+    so you can judge the relationship without a follow-up query. Sorted by
+    (distance asc, shared_releases desc). Capped at 500 rows."""
     return Q.find_collaborators(
         _CONN,
         int(artist_id),
         int(depth),
         int(min_shared_releases),
+        roles,
     )
 
 
