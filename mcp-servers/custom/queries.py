@@ -122,8 +122,7 @@ def search_artist(conn, name: str, limit: int) -> list[dict]:
                     WHEN y.y_start = y.y_end THEN CAST(y.y_start AS VARCHAR)
                     ELSE y.y_start || '-' || y.y_end
                END AS years_active,
-               l.top_labels,
-               h.score AS bm25_score
+               l.top_labels
           FROM hits h
           JOIN artist a ON a.id = h.id
           LEFT JOIN labels l ON l.artist_id = h.id
@@ -206,8 +205,7 @@ def search_release(
                (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
                   FROM release_artist ra WHERE ra.release_id = h.id AND ra.extra = 0) AS primary_artists,
                (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                  FROM release_label rl WHERE rl.release_id = h.id) AS labels,
-               h.score AS bm25_score
+                  FROM release_label rl WHERE rl.release_id = h.id) AS labels
           FROM hits h
          ORDER BY {match_tier_out},
                   h.score DESC,
@@ -249,8 +247,7 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
         )
         SELECT l.id, l.name, l.parent_id, l.parent_name,
                (SELECT COUNT(*) FROM label sl WHERE sl.parent_id = l.id) AS sublabel_count,
-               (SELECT COUNT(*) FROM release_label rl WHERE rl.label_id = l.id) AS release_count,
-               h.score AS bm25_score
+               (SELECT COUNT(*) FROM release_label rl WHERE rl.label_id = l.id) AS release_count
           FROM hits h
           JOIN label l ON l.id = h.id
          ORDER BY {match_tier_out},
@@ -268,8 +265,8 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
 
 def get_artist(conn, artist_id: int, compact: bool = False) -> Optional[dict]:
     cur = conn.cursor()
-    cols = "a.id, a.name, a.realname, a.data_quality" if compact else (
-        "a.id, a.name, a.realname, a.profile, a.data_quality"
+    cols = "a.id, a.name, a.realname" if compact else (
+        "a.id, a.name, a.realname, a.profile"
     )
     cur.execute(
         f"""
@@ -309,8 +306,7 @@ def get_release(conn, release_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT r.id, r.title, r.released_raw, r.released_year, r.country, r.notes,
-               r.data_quality, r.master_id,
+        SELECT r.id, r.title, r.released_year, r.country, r.notes, r.master_id,
           (SELECT LIST({
                     'track_id': t.track_id,
                     'sequence': t.sequence,
@@ -358,8 +354,7 @@ def get_release(conn, release_id: int) -> Optional[dict]:
         return None
 
     release = {k: row[k] for k in (
-        "id", "title", "released_raw", "released_year", "country", "notes",
-        "data_quality", "master_id",
+        "id", "title", "released_year", "country", "notes", "master_id",
     )}
     tracks = row["tracklist"] or []
     for t in tracks:
@@ -385,7 +380,7 @@ def get_label(conn, label_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, name, contact_info, profile, parent_id, parent_name, data_quality
+        SELECT id, name, contact_info, profile, parent_id, parent_name
           FROM label WHERE id = ?
         """,
         [label_id],
@@ -1091,11 +1086,6 @@ def get_scene_snapshot(
     )
     row = _one(cur)
     return {
-        "filters": {
-            "label_ids": label_ids,
-            "year_range": list(year_range) if year_range else None,
-            "country": country,
-        },
         "release_count": row["release_count"],
         "top_artists": row["top_artists"] or [],
         "top_releases": row["top_releases"] or [],
