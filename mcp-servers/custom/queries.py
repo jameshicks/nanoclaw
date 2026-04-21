@@ -81,9 +81,12 @@ def search_artist(conn, name: str, limit: int) -> list[dict]:
     cur.execute(
         f"""
         WITH hits AS (
-          SELECT id, fts_main_artist.match_bm25(id, ?) AS score
-            FROM artist
-           WHERE fts_main_artist.match_bm25(id, ?) IS NOT NULL
+          SELECT id, score
+            FROM (
+              SELECT id, name, fts_main_artist.match_bm25(id, ?) AS score
+                FROM artist
+            ) t
+           WHERE score IS NOT NULL
            ORDER BY {match_tier_sql_hits},
                     score DESC
            LIMIT ?
@@ -130,7 +133,7 @@ def search_artist(conn, name: str, limit: int) -> list[dict]:
                   LENGTH(a.name) ASC
          LIMIT ?
         """,
-        [name, name, name, norm_query, fts_fetch, name, norm_query, limit],
+        [name, name, norm_query, fts_fetch, name, norm_query, limit],
     )
     return _rows(cur)
 
@@ -143,45 +146,72 @@ def search_release(
     limit: int,
 ) -> list[dict]:
     limit = _clamp(limit, 1, 100)
-    clauses = ["score IS NOT NULL"]
-    params: list[Any] = [title, title]
+    fts_fetch = max(limit * 5, 50)
+    norm_query = _normalize_name(title)
+    title_norm_hits = _sql_normalize("rel.title")
+    title_norm_out = _sql_normalize("h.title")
+    match_tier_hits = (
+        f"CASE WHEN LOWER(rel.title) = LOWER(?) THEN 0 "
+        f"WHEN {title_norm_hits} = ? THEN 1 ELSE 2 END"
+    )
+    match_tier_out = (
+        f"CASE WHEN LOWER(h.title) = LOWER(?) THEN 0 "
+        f"WHEN {title_norm_out} = ? THEN 1 ELSE 2 END"
+    )
+
+    extra_clauses: list[str] = []
+    extra_params: list[Any] = []
     if year is not None:
-        clauses.append("r.released_year = ?")
-        params.append(int(year))
+        extra_clauses.append("rel.released_year = ?")
+        extra_params.append(int(year))
     if artist:
-        clauses.append(
+        extra_clauses.append(
             """EXISTS (
                 SELECT 1 FROM release_artist ra
                 LEFT JOIN artist a ON a.id = ra.artist_id
-                WHERE ra.release_id = r.id
+                WHERE ra.release_id = rel.id
                   AND ra.extra = 0
                   AND (ra.artist_name ILIKE ? OR a.name ILIKE ?)
             )"""
         )
         like = f"%{artist}%"
-        params.extend([like, like])
-    params.append(limit)
-    where = " AND ".join(clauses)
+        extra_params.extend([like, like])
+    extra_where = (" AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
+
+    params = [
+        title,
+        *extra_params,
+        title, norm_query,
+        fts_fetch,
+        title, norm_query,
+        limit,
+    ]
 
     cur = conn.cursor()
     cur.execute(
         f"""
-        WITH scored AS (
-          SELECT r.id, r.title, r.released_year, r.country, r.master_id,
-                 fts_main_release.match_bm25(r.id, ?) AS score
-            FROM release r
-           WHERE fts_main_release.match_bm25(r.id, ?) IS NOT NULL
+        WITH hits AS (
+          SELECT rel.id, rel.title, rel.released_year, rel.country, rel.master_id, rel.score
+            FROM (
+              SELECT r.id, r.title, r.released_year, r.country, r.master_id,
+                     fts_main_release.match_bm25(r.id, ?) AS score
+                FROM release r
+            ) rel
+           WHERE rel.score IS NOT NULL{extra_where}
+           ORDER BY {match_tier_hits},
+                    rel.score DESC
+           LIMIT ?
         )
-        SELECT s.id, s.title, s.released_year AS year, s.country, s.master_id,
+        SELECT h.id, h.title, h.released_year AS year, h.country, h.master_id,
                (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
-                  FROM release_artist ra WHERE ra.release_id = s.id AND ra.extra = 0) AS primary_artists,
+                  FROM release_artist ra WHERE ra.release_id = h.id AND ra.extra = 0) AS primary_artists,
                (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                  FROM release_label rl WHERE rl.release_id = s.id) AS labels,
-               s.score AS bm25_score
-          FROM scored s
-          JOIN release r ON r.id = s.id
-         WHERE {where}
-         ORDER BY s.score DESC
+                  FROM release_label rl WHERE rl.release_id = h.id) AS labels,
+               h.score AS bm25_score
+          FROM hits h
+         ORDER BY {match_tier_out},
+                  h.score DESC,
+                  LENGTH(h.title) ASC
          LIMIT ?
         """,
         params,
@@ -207,9 +237,12 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
     cur.execute(
         f"""
         WITH hits AS (
-          SELECT id, fts_main_label.match_bm25(id, ?) AS score
-            FROM label
-           WHERE fts_main_label.match_bm25(id, ?) IS NOT NULL
+          SELECT id, score
+            FROM (
+              SELECT id, name, fts_main_label.match_bm25(id, ?) AS score
+                FROM label
+            ) t
+           WHERE score IS NOT NULL
            ORDER BY {match_tier_hits},
                     score DESC
            LIMIT ?
@@ -225,7 +258,7 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
                   LENGTH(l.name) ASC
          LIMIT ?
         """,
-        [name, name, name, norm_query, fts_fetch, name, norm_query, limit],
+        [name, name, norm_query, fts_fetch, name, norm_query, limit],
     )
     return _rows(cur)
 
@@ -235,151 +268,116 @@ def search_label(conn, name: str, limit: int) -> list[dict]:
 
 def get_artist(conn, artist_id: int, compact: bool = False) -> Optional[dict]:
     cur = conn.cursor()
-    cols = "id, name, realname, data_quality" if compact else "id, name, realname, profile, data_quality"
+    cols = "a.id, a.name, a.realname, a.data_quality" if compact else (
+        "a.id, a.name, a.realname, a.profile, a.data_quality"
+    )
     cur.execute(
-        f"SELECT {cols} FROM artist WHERE id = ?",
+        f"""
+        SELECT {cols},
+          (SELECT LIST({{'alias_artist_id': alias_artist_id, 'alias_name': alias_name}}
+                       ORDER BY alias_name)
+             FROM artist_alias WHERE artist_id = a.id) AS aliases,
+          (SELECT LIST(name ORDER BY name)
+             FROM artist_namevariation WHERE artist_id = a.id) AS name_variations,
+          (SELECT LIST(url ORDER BY url)
+             FROM artist_url WHERE artist_id = a.id) AS urls,
+          (SELECT LIST({{'artist_id': gm.group_artist_id, 'name': ga.name}}
+                       ORDER BY ga.name)
+             FROM group_member gm
+             LEFT JOIN artist ga ON ga.id = gm.group_artist_id
+            WHERE gm.member_artist_id = a.id) AS groups,
+          (SELECT LIST({{'artist_id': member_artist_id, 'name': member_name}}
+                       ORDER BY member_name)
+             FROM group_member WHERE group_artist_id = a.id) AS members
+          FROM artist a WHERE a.id = ?
+        """,
         [artist_id],
     )
     artist = _one(cur)
     if artist is None:
         return None
-
-    cur.execute(
-        "SELECT alias_artist_id, alias_name FROM artist_alias WHERE artist_id = ? ORDER BY alias_name",
-        [artist_id],
-    )
-    artist["aliases"] = _rows(cur)
-
-    cur.execute(
-        "SELECT name FROM artist_namevariation WHERE artist_id = ? ORDER BY name",
-        [artist_id],
-    )
-    artist["name_variations"] = [r["name"] for r in _rows(cur)]
-
-    cur.execute(
-        "SELECT url FROM artist_url WHERE artist_id = ? ORDER BY url",
-        [artist_id],
-    )
-    artist["urls"] = [r["url"] for r in _rows(cur)]
-
-    cur.execute(
-        """
-        SELECT gm.group_artist_id AS artist_id, a.name
-          FROM group_member gm
-          LEFT JOIN artist a ON a.id = gm.group_artist_id
-         WHERE gm.member_artist_id = ?
-         ORDER BY a.name
-        """,
-        [artist_id],
-    )
-    artist["groups"] = _rows(cur)
-
-    cur.execute(
-        """
-        SELECT gm.member_artist_id AS artist_id, gm.member_name AS name
-          FROM group_member gm
-         WHERE gm.group_artist_id = ?
-         ORDER BY gm.member_name
-        """,
-        [artist_id],
-    )
-    artist["members"] = _rows(cur)
-
+    for key in ("aliases", "name_variations", "urls", "groups", "members"):
+        if artist.get(key) is None:
+            artist[key] = []
     return artist
 
 
 def get_release(conn, release_id: int) -> Optional[dict]:
+    # One query, many LIST subqueries. Nested struct LIST for tracklist -> credits
+    # so the whole release fans out in a single round-trip. Empty subqueries come
+    # back as NULL; normalize to [] below.
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, title, released_raw, released_year, country, notes,
-               data_quality, master_id
-          FROM release WHERE id = ?
+        SELECT r.id, r.title, r.released_raw, r.released_year, r.country, r.notes,
+               r.data_quality, r.master_id,
+          (SELECT LIST({
+                    'track_id': t.track_id,
+                    'sequence': t.sequence,
+                    'position': t.position,
+                    'parent': t.parent,
+                    'title': t.title,
+                    'duration': t.duration,
+                    'credits': (SELECT LIST({'artist_id': ta.artist_id,
+                                             'artist_name': ta.artist_name,
+                                             'extra': ta.extra,
+                                             'anv': ta.anv,
+                                             'position': ta.position,
+                                             'join_string': ta.join_string,
+                                             'role': ta.role}
+                                            ORDER BY ta.extra, ta.position)
+                                  FROM release_track_artist ta
+                                 WHERE ta.release_id = t.release_id
+                                   AND ta.track_id = t.track_id)
+                 } ORDER BY t.sequence, t.position)
+             FROM release_track t WHERE t.release_id = r.id) AS tracklist,
+          (SELECT LIST({'artist_id': artist_id, 'artist_name': artist_name,
+                        'extra': extra, 'anv': anv, 'position': position,
+                        'join_string': join_string, 'role': role, 'tracks': tracks}
+                       ORDER BY extra, position)
+             FROM release_artist WHERE release_id = r.id) AS credits,
+          (SELECT LIST({'name': name, 'qty': qty, 'descriptions': descriptions,
+                        'text_string': text_string} ORDER BY name)
+             FROM release_format WHERE release_id = r.id) AS formats,
+          (SELECT LIST({'label_id': label_id, 'label_name': label_name, 'catno': catno}
+                       ORDER BY label_name)
+             FROM release_label WHERE release_id = r.id) AS labels,
+          (SELECT LIST(DISTINCT genre ORDER BY genre)
+             FROM release_genre WHERE release_id = r.id) AS genres,
+          (SELECT LIST(DISTINCT style ORDER BY style)
+             FROM release_style WHERE release_id = r.id) AS styles,
+          (SELECT LIST({'type': "type", 'value': "value", 'description': description}
+                       ORDER BY "type", "value")
+             FROM release_identifier WHERE release_id = r.id) AS identifiers
+          FROM release r WHERE r.id = ?
         """,
         [release_id],
     )
-    release = _one(cur)
-    if release is None:
+    row = _one(cur)
+    if row is None:
         return None
 
-    cur.execute(
-        """
-        SELECT release_id, sequence, position, parent, title, duration, track_id
-          FROM release_track
-         WHERE release_id = ?
-         ORDER BY sequence, position
-        """,
-        [release_id],
-    )
-    tracks = _rows(cur)
-
-    cur.execute(
-        """
-        SELECT track_id, artist_id, artist_name, extra, anv, position, join_string, role
-          FROM release_track_artist
-         WHERE release_id = ?
-         ORDER BY track_id, extra, position
-        """,
-        [release_id],
-    )
-    track_credits: dict[str, list[dict]] = {}
-    for row in _rows(cur):
-        tid = row.pop("track_id")
-        track_credits.setdefault(tid, []).append(row)
+    release = {k: row[k] for k in (
+        "id", "title", "released_raw", "released_year", "country", "notes",
+        "data_quality", "master_id",
+    )}
+    tracks = row["tracklist"] or []
     for t in tracks:
-        t["credits"] = track_credits.get(t["track_id"], [])
-
-    cur.execute(
-        """
-        SELECT artist_id, artist_name, extra, anv, position, join_string, role, tracks
-          FROM release_artist WHERE release_id = ?
-         ORDER BY extra, position
-        """,
-        [release_id],
-    )
-    creds = _rows(cur)
+        if t.get("credits") is None:
+            t["credits"] = []
+    creds = row["credits"] or []
     primary = [c for c in creds if c["extra"] == 0]
     additional = [c for c in creds if c["extra"] == 1]
-
-    cur.execute(
-        "SELECT name, qty, descriptions, text_string FROM release_format WHERE release_id = ? ORDER BY name",
-        [release_id],
-    )
-    formats = _rows(cur)
-
-    cur.execute(
-        "SELECT label_id, label_name, catno FROM release_label WHERE release_id = ? ORDER BY label_name",
-        [release_id],
-    )
-    labels = _rows(cur)
-
-    cur.execute(
-        "SELECT DISTINCT genre FROM release_genre WHERE release_id = ? ORDER BY genre",
-        [release_id],
-    )
-    genres = [r["genre"] for r in _rows(cur)]
-
-    cur.execute(
-        "SELECT DISTINCT style FROM release_style WHERE release_id = ? ORDER BY style",
-        [release_id],
-    )
-    styles = [r["style"] for r in _rows(cur)]
-
-    cur.execute(
-        "SELECT type, value, description FROM release_identifier WHERE release_id = ? ORDER BY type, value",
-        [release_id],
-    )
-    identifiers = _rows(cur)
 
     return {
         "release": release,
         "tracklist": tracks,
         "credits": {"primary": primary, "additional": additional},
-        "formats": formats,
-        "labels": labels,
-        "genres": genres,
-        "styles": styles,
-        "identifiers": identifiers,
+        "formats": row["formats"] or [],
+        "labels": row["labels"] or [],
+        "genres": row["genres"] or [],
+        "styles": row["styles"] or [],
+        "identifiers": row["identifiers"] or [],
     }
 
 
@@ -519,6 +517,11 @@ def get_artist_discography(
     where = " AND ".join(clauses)
     cur = conn.cursor()
 
+    # Deterministic aggregates per (artist, release):
+    #   role  — join all distinct roles ("Producer; Written-By") so multi-role
+    #           credits don't get truncated to an arbitrary pick.
+    #   extra — MIN: if any credit on this release is primary (0), the release
+    #           is primary for this artist.
     if unique_masters_only:
         # Collapse to one row per master (earliest-year, lowest-id pressing).
         # Standalone releases (master_id IS NULL) keyed by -id — Discogs IDs
@@ -527,8 +530,8 @@ def get_artist_discography(
             f"""
             WITH releases AS (
               SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
-                     FIRST(ra.role) AS role,
-                     FIRST(ra.extra) AS extra
+                     STRING_AGG(DISTINCT ra.role, '; ' ORDER BY ra.role) AS role,
+                     MIN(ra.extra) AS extra
                 FROM release_artist ra
                 JOIN release r ON r.id = ra.release_id
                WHERE {where}
@@ -542,31 +545,55 @@ def get_artist_discography(
                      ) AS _rank,
                      COUNT(*) OVER (PARTITION BY COALESCE(master_id, -id)) AS pressings_count
                 FROM releases
+            ),
+            top_rows AS (
+              SELECT id, title, year, country, master_id, role, extra, pressings_count
+                FROM deduped
+               WHERE _rank = 1
+               ORDER BY year NULLS LAST, title
+               LIMIT 500
+            ),
+            labels_agg AS (
+              SELECT rl.release_id,
+                     STRING_AGG(DISTINCT rl.label_name, '; ' ORDER BY rl.label_name) AS labels
+                FROM release_label rl
+                JOIN top_rows t ON t.id = rl.release_id
+               GROUP BY rl.release_id
             )
-            SELECT id, title, year, country, master_id, role, extra, pressings_count,
-                   (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                      FROM release_label rl WHERE rl.release_id = deduped.id) AS labels
-              FROM deduped
-             WHERE _rank = 1
-             ORDER BY year NULLS LAST, title
-             LIMIT 500
+            SELECT t.id, t.title, t.year, t.country, t.master_id,
+                   t.role, t.extra, t.pressings_count, la.labels
+              FROM top_rows t
+              LEFT JOIN labels_agg la ON la.release_id = t.id
+             ORDER BY t.year NULLS LAST, t.title
             """,
             params,
         )
     else:
         cur.execute(
             f"""
-            SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
-                   FIRST(ra.role) AS role,
-                   FIRST(ra.extra) AS extra,
-                   (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                      FROM release_label rl WHERE rl.release_id = r.id) AS labels
-              FROM release_artist ra
-              JOIN release r ON r.id = ra.release_id
-             WHERE {where}
-             GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
-             ORDER BY year NULLS LAST, r.title
-             LIMIT 500
+            WITH base AS (
+              SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                     STRING_AGG(DISTINCT ra.role, '; ' ORDER BY ra.role) AS role,
+                     MIN(ra.extra) AS extra
+                FROM release_artist ra
+                JOIN release r ON r.id = ra.release_id
+               WHERE {where}
+               GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+               ORDER BY year NULLS LAST, r.title
+               LIMIT 500
+            ),
+            labels_agg AS (
+              SELECT rl.release_id,
+                     STRING_AGG(DISTINCT rl.label_name, '; ' ORDER BY rl.label_name) AS labels
+                FROM release_label rl
+                JOIN base b ON b.id = rl.release_id
+               GROUP BY rl.release_id
+            )
+            SELECT b.id, b.title, b.year, b.country, b.master_id,
+                   b.role, b.extra, la.labels
+              FROM base b
+              LEFT JOIN labels_agg la ON la.release_id = b.id
+             ORDER BY b.year NULLS LAST, b.title
             """,
             params,
         )
@@ -588,12 +615,15 @@ def get_label_releases(
     where = " AND ".join(clauses)
     cur = conn.cursor()
 
+    # `catno` can have multiple distinct values per (release, label) in rare
+    # cases (different sides/discs carrying different cat numbers). Join them
+    # so the output is stable.
     if unique_masters_only:
         cur.execute(
             f"""
             WITH releases AS (
               SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
-                     FIRST(rl.catno) AS catno
+                     STRING_AGG(DISTINCT rl.catno, '; ' ORDER BY rl.catno) AS catno
                 FROM release_label rl
                 JOIN release r ON r.id = rl.release_id
                WHERE {where}
@@ -607,30 +637,56 @@ def get_label_releases(
                      ) AS _rank,
                      COUNT(*) OVER (PARTITION BY COALESCE(master_id, -id)) AS pressings_count
                 FROM releases
+            ),
+            top_rows AS (
+              SELECT id, title, year, country, master_id, catno, pressings_count
+                FROM deduped
+               WHERE _rank = 1
+               ORDER BY year NULLS LAST, title
+               LIMIT 500
+            ),
+            artists_agg AS (
+              SELECT ra.release_id,
+                     STRING_AGG(DISTINCT ra.artist_name, ' / ' ORDER BY ra.artist_name) AS primary_artists
+                FROM release_artist ra
+                JOIN top_rows t ON t.id = ra.release_id
+               WHERE ra.extra = 0
+               GROUP BY ra.release_id
             )
-            SELECT id, title, year, country, master_id, catno, pressings_count,
-                   (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
-                      FROM release_artist ra WHERE ra.release_id = deduped.id AND ra.extra = 0) AS primary_artists
-              FROM deduped
-             WHERE _rank = 1
-             ORDER BY year NULLS LAST, title
-             LIMIT 500
+            SELECT t.id, t.title, t.year, t.country, t.master_id,
+                   t.catno, t.pressings_count, aa.primary_artists
+              FROM top_rows t
+              LEFT JOIN artists_agg aa ON aa.release_id = t.id
+             ORDER BY t.year NULLS LAST, t.title
             """,
             params,
         )
     else:
         cur.execute(
             f"""
-            SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
-                   FIRST(rl.catno) AS catno,
-                   (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
-                      FROM release_artist ra WHERE ra.release_id = r.id AND ra.extra = 0) AS primary_artists
-              FROM release_label rl
-              JOIN release r ON r.id = rl.release_id
-             WHERE {where}
-             GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
-             ORDER BY year NULLS LAST, r.title
-             LIMIT 500
+            WITH base AS (
+              SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+                     STRING_AGG(DISTINCT rl.catno, '; ' ORDER BY rl.catno) AS catno
+                FROM release_label rl
+                JOIN release r ON r.id = rl.release_id
+               WHERE {where}
+               GROUP BY r.id, r.title, r.released_year, r.country, r.master_id
+               ORDER BY year NULLS LAST, r.title
+               LIMIT 500
+            ),
+            artists_agg AS (
+              SELECT ra.release_id,
+                     STRING_AGG(DISTINCT ra.artist_name, ' / ' ORDER BY ra.artist_name) AS primary_artists
+                FROM release_artist ra
+                JOIN base b ON b.id = ra.release_id
+               WHERE ra.extra = 0
+               GROUP BY ra.release_id
+            )
+            SELECT b.id, b.title, b.year, b.country, b.master_id,
+                   b.catno, aa.primary_artists
+              FROM base b
+              LEFT JOIN artists_agg aa ON aa.release_id = b.id
+             ORDER BY b.year NULLS LAST, b.title
             """,
             params,
         )
@@ -688,103 +744,107 @@ def find_collaborators(
     visited: set[int] = {artist_id}
     frontier: set[int] = {artist_id}
     results: list[dict] = []
-    # Keyed by (seed_at_this_level, neighbor) but we only surface per-neighbor titles
-    # relative to the seed artist, not the cumulative path. That means "top_shared_titles"
-    # is scoped to this BFS hop, which is the right question the agent is asking.
-    titles_by_neighbor: dict[int, list[str]] = {}
 
     cur = conn.cursor()
     for d in range(1, depth + 1):
         if not frontier:
             break
-        cur.execute(
-            f"""
-            SELECT ra2.artist_id, a.name,
-                   COUNT(DISTINCT ra2.release_id) AS shared_releases
-              FROM release_artist ra1
-              JOIN release_artist ra2
-                ON ra2.release_id = ra1.release_id
-               AND ra2.artist_id <> ra1.artist_id
-              LEFT JOIN artist a ON a.id = ra2.artist_id
-             WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
-               AND ra1.extra = 0
-               AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
-               {role_sql}
-             GROUP BY ra2.artist_id, a.name
-            HAVING COUNT(DISTINCT ra2.release_id) >= ?
-             ORDER BY shared_releases DESC
-             LIMIT 2000
-            """,
-            [list(frontier), list(visited), *role_params, min_shared],
-        )
-        new_rows = _rows(cur)
+        if include_top_shared_titles:
+            # One pass per hop: MATERIALIZED edges CTE feeds both the neighbor
+            # counts and the top-3 shared titles, avoiding the double self-join.
+            # Title dedup is by title (not release_id) so pressings/editions
+            # collapse; year-then-id ordering makes the titles read as a rough
+            # timeline.
+            cur.execute(
+                f"""
+                WITH edges AS MATERIALIZED (
+                  SELECT ra2.artist_id AS neighbor_id, a.name,
+                         ra2.release_id, r.title, r.released_year AS year
+                    FROM release_artist ra1
+                    JOIN release_artist ra2
+                      ON ra2.release_id = ra1.release_id
+                     AND ra2.artist_id <> ra1.artist_id
+                    JOIN release r ON r.id = ra1.release_id
+                    LEFT JOIN artist a ON a.id = ra2.artist_id
+                   WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                     AND ra1.extra = 0
+                     AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                     {role_sql}
+                ),
+                neighbor_stats AS (
+                  SELECT neighbor_id, ANY_VALUE(name) AS name,
+                         COUNT(DISTINCT release_id) AS shared_releases
+                    FROM edges
+                   GROUP BY neighbor_id
+                  HAVING COUNT(DISTINCT release_id) >= ?
+                   ORDER BY shared_releases DESC
+                   LIMIT 2000
+                ),
+                title_stats AS (
+                  SELECT e.neighbor_id, e.title,
+                         MIN(COALESCE(e.year, 9999)) AS year_rank,
+                         MIN(e.release_id) AS id_rank
+                    FROM edges e
+                   WHERE e.neighbor_id IN (SELECT neighbor_id FROM neighbor_stats)
+                   GROUP BY e.neighbor_id, e.title
+                ),
+                ranked AS (
+                  SELECT neighbor_id, title,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY neighbor_id
+                           ORDER BY year_rank, id_rank
+                         ) AS rn
+                    FROM title_stats
+                )
+                SELECT ns.neighbor_id AS artist_id, ns.name, ns.shared_releases,
+                       (SELECT LIST(title ORDER BY rn)
+                          FROM ranked
+                         WHERE neighbor_id = ns.neighbor_id AND rn <= 3) AS top_shared_titles
+                  FROM neighbor_stats ns
+                 ORDER BY ns.shared_releases DESC
+                """,
+                [list(frontier), list(visited), *role_params, min_shared],
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT ra2.artist_id, a.name,
+                       COUNT(DISTINCT ra2.release_id) AS shared_releases
+                  FROM release_artist ra1
+                  JOIN release_artist ra2
+                    ON ra2.release_id = ra1.release_id
+                   AND ra2.artist_id <> ra1.artist_id
+                  LEFT JOIN artist a ON a.id = ra2.artist_id
+                 WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   AND ra1.extra = 0
+                   AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   {role_sql}
+                 GROUP BY ra2.artist_id, a.name
+                HAVING COUNT(DISTINCT ra2.release_id) >= ?
+                 ORDER BY shared_releases DESC
+                 LIMIT 2000
+                """,
+                [list(frontier), list(visited), *role_params, min_shared],
+            )
+
         new_frontier: set[int] = set()
-        level_neighbor_ids: list[int] = []
-        for row in new_rows:
+        for row in _rows(cur):
             aid = row["artist_id"]
             if aid in visited:
                 continue
             visited.add(aid)
             new_frontier.add(aid)
-            level_neighbor_ids.append(aid)
             results.append(
                 {
                     "artist_id": aid,
                     "name": row["name"],
                     "distance": d,
                     "shared_releases": row["shared_releases"],
-                    "top_shared_titles": [],
+                    "top_shared_titles": row.get("top_shared_titles") or [],
                 }
             )
 
-        # Batch fetch top 3 distinct shared release titles for the neighbors at this
-        # level. Group by title (not release_id) to dedupe across pressings/editions —
-        # e.g. "Press Color" on US + UK + France collapses to one entry. Ordered by
-        # earliest-known year so the titles make a rough timeline.
-        if level_neighbor_ids and include_top_shared_titles:
-            cur.execute(
-                f"""
-                WITH edges AS (
-                  SELECT DISTINCT ra2.artist_id AS neighbor_id,
-                         r.id AS release_id, r.title, r.released_year AS year
-                    FROM release_artist ra1
-                    JOIN release_artist ra2
-                      ON ra2.release_id = ra1.release_id
-                     AND ra2.artist_id <> ra1.artist_id
-                    JOIN release r ON r.id = ra1.release_id
-                   WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
-                     AND ra1.extra = 0
-                     AND ra2.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
-                     {role_sql}
-                ),
-                titles AS (
-                  SELECT neighbor_id, title,
-                         MIN(COALESCE(year, 9999)) AS year_rank,
-                         MIN(release_id) AS id_rank
-                    FROM edges
-                   GROUP BY neighbor_id, title
-                )
-                SELECT neighbor_id, title
-                  FROM (
-                    SELECT neighbor_id, title,
-                           ROW_NUMBER() OVER (
-                             PARTITION BY neighbor_id
-                             ORDER BY year_rank, id_rank
-                           ) AS rn
-                      FROM titles
-                  )
-                 WHERE rn <= 3
-                 ORDER BY neighbor_id, rn
-                """,
-                [list(frontier), level_neighbor_ids, *role_params],
-            )
-            for neighbor_id, title in cur.fetchall():
-                titles_by_neighbor.setdefault(neighbor_id, []).append(title)
-
         frontier = new_frontier
-
-    for r in results:
-        r["top_shared_titles"] = titles_by_neighbor.get(r["artist_id"], [])
 
     results.sort(key=lambda r: (r["distance"], -r["shared_releases"]))
     results = results[:500]
@@ -821,52 +881,114 @@ def find_path_between_artists(
         return {"path": [{"id": artist_a_id}], "depth": 0}
     max_depth = _clamp(max_depth, 1, 6)
 
-    frontier: dict[int, list[int]] = {artist_a_id: [artist_a_id]}
-    visited: set[int] = {artist_a_id}
+    # Bidirectional BFS. The graph is directed (edges go from a primary-credited
+    # artist to anyone credited on their release), so we expand forward from A
+    # (ra1.artist_id IN frontier) and backward from B (ra2.artist_id IN frontier,
+    # collecting predecessors ra1). Each iteration expands whichever side has
+    # the smaller frontier — this is where the big win comes from: on prolific
+    # seeds the other side stays tiny and caps the total work.
+    FRONTIER_CAP = 5000
+    parents_a: dict[int, Optional[int]] = {artist_a_id: None}
+    parents_b: dict[int, Optional[int]] = {artist_b_id: None}
+    frontier_a: set[int] = {artist_a_id}
+    frontier_b: set[int] = {artist_b_id}
+    depth_a = 0
+    depth_b = 0
     cur = conn.cursor()
 
-    for d in range(1, max_depth + 1):
-        if not frontier:
-            return {"path": None, "reason": "no_path", "max_depth_searched": d - 1}
-
-        # Frontier size cap to prevent runaway cost on prolific seeds.
-        if len(frontier) > 5000:
-            frontier = dict(list(frontier.items())[:5000])
-
+    def build_path(meet: int) -> dict:
+        forward: list[int] = []
+        n: Optional[int] = meet
+        while n is not None:
+            forward.append(n)
+            n = parents_a[n]
+        forward.reverse()  # A ... meet
+        backward: list[int] = []
+        n = parents_b[meet]
+        while n is not None:
+            backward.append(n)
+            n = parents_b[n]
+        full = forward + backward  # A ... meet ... B
         cur.execute(
-            """
-            SELECT DISTINCT ra1.artist_id AS from_id, ra2.artist_id AS to_id
-              FROM release_artist ra1
-              JOIN release_artist ra2
-                ON ra2.release_id = ra1.release_id
-               AND ra2.artist_id <> ra1.artist_id
-             WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
-               AND ra1.extra = 0
-            """,
-            [list(frontier.keys())],
+            "SELECT id, name FROM artist WHERE id IN (SELECT UNNEST(CAST(? AS BIGINT[])))",
+            [full],
         )
-        edges = cur.fetchall()
+        name_map = {r[0]: r[1] for r in cur.fetchall()}
+        return {
+            "path": [{"id": i, "name": name_map.get(i)} for i in full],
+            "depth": len(full) - 1,
+        }
 
-        next_frontier: dict[int, list[int]] = {}
-        for from_id, to_id in edges:
-            if to_id in visited or to_id in next_frontier:
-                continue
-            path = frontier[from_id] + [to_id]
-            if to_id == artist_b_id:
-                cur.execute(
-                    "SELECT id, name FROM artist WHERE id IN (SELECT UNNEST(CAST(? AS BIGINT[])))",
-                    [path],
-                )
-                name_map = {r[0]: r[1] for r in cur.fetchall()}
-                return {
-                    "path": [{"id": i, "name": name_map.get(i)} for i in path],
-                    "depth": d,
-                }
-            next_frontier[to_id] = path
+    def capped(frontier: set[int]) -> list[int]:
+        if len(frontier) > FRONTIER_CAP:
+            return list(frontier)[:FRONTIER_CAP]
+        return list(frontier)
 
-        visited.update(next_frontier.keys())
-        frontier = next_frontier
+    while depth_a + depth_b < max_depth:
+        if not frontier_a and not frontier_b:
+            break
+        # Prefer the smaller non-empty frontier.
+        if not frontier_a:
+            expand_a = False
+        elif not frontier_b:
+            expand_a = True
+        else:
+            expand_a = len(frontier_a) <= len(frontier_b)
 
+        if expand_a:
+            cur.execute(
+                """
+                SELECT DISTINCT ra1.artist_id AS from_id, ra2.artist_id AS to_id
+                  FROM release_artist ra1
+                  JOIN release_artist ra2
+                    ON ra2.release_id = ra1.release_id
+                   AND ra2.artist_id <> ra1.artist_id
+                 WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   AND ra1.extra = 0
+                """,
+                [capped(frontier_a)],
+            )
+            new_frontier: set[int] = set()
+            for from_id, to_id in cur.fetchall():
+                if to_id in parents_a:
+                    continue
+                parents_a[to_id] = from_id
+                new_frontier.add(to_id)
+            depth_a += 1
+            meet = new_frontier & parents_b.keys()
+            if meet:
+                return build_path(next(iter(meet)))
+            frontier_a = new_frontier
+        else:
+            # Backward expand: find predecessors of nodes in frontier_b.
+            cur.execute(
+                """
+                SELECT DISTINCT ra1.artist_id AS from_id, ra2.artist_id AS to_id
+                  FROM release_artist ra1
+                  JOIN release_artist ra2
+                    ON ra2.release_id = ra1.release_id
+                   AND ra2.artist_id <> ra1.artist_id
+                 WHERE ra2.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   AND ra1.extra = 0
+                """,
+                [capped(frontier_b)],
+            )
+            new_frontier = set()
+            for from_id, to_id in cur.fetchall():
+                # `from_id` is a predecessor; its parent in the B-tree points
+                # toward B via `to_id` (an already-visited B-side node).
+                if from_id in parents_b:
+                    continue
+                parents_b[from_id] = to_id
+                new_frontier.add(from_id)
+            depth_b += 1
+            meet = new_frontier & parents_a.keys()
+            if meet:
+                return build_path(next(iter(meet)))
+            frontier_b = new_frontier
+
+    if not frontier_a and not frontier_b:
+        return {"path": None, "reason": "no_path", "max_depth_searched": depth_a + depth_b}
     return {"path": None, "reason": "max_depth_exceeded", "max_depth_searched": max_depth}
 
 
@@ -900,117 +1022,121 @@ def get_scene_snapshot(
 
     where = " AND ".join(release_filters)
 
-    cte = f"""
-      WITH matching_releases AS (
-        SELECT r.id
-          FROM release r
-         WHERE {where}
-      )
-    """
-
+    # Single statement: MATERIALIZED matching_releases is computed once, then
+    # shared across the count + five top-N aggregates. Replaces six separate
+    # executions of the same CTE.
     cur = conn.cursor()
-
-    cur.execute(f"{cte} SELECT COUNT(*) AS n FROM matching_releases", params)
-    release_count = cur.fetchone()[0]
-
     cur.execute(
-        f"""{cte}
-        SELECT ra.artist_id, a.name, COUNT(DISTINCT ra.release_id) AS release_count
-          FROM release_artist ra
-          JOIN matching_releases mr ON mr.id = ra.release_id
-          LEFT JOIN artist a ON a.id = ra.artist_id
-         WHERE ra.extra = 0
-         GROUP BY ra.artist_id, a.name
-         ORDER BY release_count DESC
-         LIMIT 20
+        f"""
+        WITH matching_releases AS MATERIALIZED (
+          SELECT r.id
+            FROM release r
+           WHERE {where}
+        ),
+        top_artists AS (
+          SELECT ra.artist_id, ANY_VALUE(a.name) AS name,
+                 COUNT(DISTINCT ra.release_id) AS release_count
+            FROM release_artist ra
+            JOIN matching_releases mr ON mr.id = ra.release_id
+            LEFT JOIN artist a ON a.id = ra.artist_id
+           WHERE ra.extra = 0
+           GROUP BY ra.artist_id
+           ORDER BY release_count DESC
+           LIMIT 20
+        ),
+        top_releases AS (
+          SELECT r.id, r.title, r.released_year AS year,
+                 COUNT(*) AS credit_count
+            FROM release_artist ra
+            JOIN matching_releases mr ON mr.id = ra.release_id
+            JOIN release r ON r.id = mr.id
+           GROUP BY r.id, r.title, r.released_year
+           ORDER BY credit_count DESC
+           LIMIT 20
+        ),
+        top_formats AS (
+          SELECT rf.name AS format, COUNT(*) AS n
+            FROM release_format rf
+            JOIN matching_releases mr ON mr.id = rf.release_id
+           GROUP BY rf.name ORDER BY n DESC LIMIT 25
+        ),
+        top_genres AS (
+          SELECT rg.genre, COUNT(*) AS n
+            FROM release_genre rg
+            JOIN matching_releases mr ON mr.id = rg.release_id
+           GROUP BY rg.genre ORDER BY n DESC LIMIT 25
+        ),
+        top_styles AS (
+          SELECT rs.style, COUNT(*) AS n
+            FROM release_style rs
+            JOIN matching_releases mr ON mr.id = rs.release_id
+           GROUP BY rs.style ORDER BY n DESC LIMIT 25
+        )
+        SELECT
+          (SELECT COUNT(*) FROM matching_releases) AS release_count,
+          (SELECT LIST({{'artist_id': artist_id, 'name': name, 'release_count': release_count}}
+                       ORDER BY release_count DESC)
+             FROM top_artists) AS top_artists,
+          (SELECT LIST({{'id': id, 'title': title, 'year': year, 'credit_count': credit_count}}
+                       ORDER BY credit_count DESC)
+             FROM top_releases) AS top_releases,
+          (SELECT LIST({{'format': format, 'n': n}} ORDER BY n DESC)
+             FROM top_formats) AS formats,
+          (SELECT LIST({{'genre': genre, 'n': n}} ORDER BY n DESC)
+             FROM top_genres) AS genres,
+          (SELECT LIST({{'style': style, 'n': n}} ORDER BY n DESC)
+             FROM top_styles) AS styles
         """,
         params,
     )
-    top_artists = _rows(cur)
-
-    cur.execute(
-        f"""{cte}
-        SELECT r.id, r.title, r.released_year AS year,
-               COUNT(*) AS credit_count
-          FROM release_artist ra
-          JOIN matching_releases mr ON mr.id = ra.release_id
-          JOIN release r ON r.id = mr.id
-         GROUP BY r.id, r.title, r.released_year
-         ORDER BY credit_count DESC
-         LIMIT 20
-        """,
-        params,
-    )
-    top_releases = _rows(cur)
-
-    cur.execute(
-        f"""{cte}
-        SELECT rf.name AS format, COUNT(*) AS n
-          FROM release_format rf
-          JOIN matching_releases mr ON mr.id = rf.release_id
-         GROUP BY rf.name ORDER BY n DESC LIMIT 25
-        """,
-        params,
-    )
-    formats = _rows(cur)
-
-    cur.execute(
-        f"""{cte}
-        SELECT rg.genre, COUNT(*) AS n
-          FROM release_genre rg
-          JOIN matching_releases mr ON mr.id = rg.release_id
-         GROUP BY rg.genre ORDER BY n DESC LIMIT 25
-        """,
-        params,
-    )
-    genres = _rows(cur)
-
-    cur.execute(
-        f"""{cte}
-        SELECT rs.style, COUNT(*) AS n
-          FROM release_style rs
-          JOIN matching_releases mr ON mr.id = rs.release_id
-         GROUP BY rs.style ORDER BY n DESC LIMIT 25
-        """,
-        params,
-    )
-    styles = _rows(cur)
-
+    row = _one(cur)
     return {
         "filters": {
             "label_ids": label_ids,
             "year_range": list(year_range) if year_range else None,
             "country": country,
         },
-        "release_count": release_count,
-        "top_artists": top_artists,
-        "top_releases": top_releases,
-        "formats": formats,
-        "genres": genres,
-        "styles": styles,
+        "release_count": row["release_count"],
+        "top_artists": row["top_artists"] or [],
+        "top_releases": row["top_releases"] or [],
+        "formats": row["formats"] or [],
+        "genres": row["genres"] or [],
+        "styles": row["styles"] or [],
     }
 
 
 def list_compilations_featuring_artist(conn, artist_id: int) -> list[dict]:
+    # Single pass over release_format per artist-release: one aggregate row per
+    # release gives both the "is this a (non-unofficial) compilation" gate and
+    # the Compilation-filtered descriptions, replacing three correlated scans.
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT DISTINCT r.id, r.title, r.released_year AS year, r.country,
+        WITH artist_releases AS (
+          SELECT DISTINCT r.id, r.title, r.released_year AS year, r.country
+            FROM release_artist ra
+            JOIN release r ON r.id = ra.release_id
+           WHERE ra.artist_id = ?
+        ),
+        compilation_info AS (
+          SELECT rf.release_id,
+                 STRING_AGG(DISTINCT rf.descriptions, ' | ')
+                   FILTER (WHERE rf.descriptions ILIKE '%Compilation%') AS format_descriptions,
+                 BOOL_OR(rf.descriptions ILIKE '%Compilation%'
+                         AND (rf.descriptions NOT ILIKE '%Unofficial%'
+                              OR rf.descriptions IS NULL)) AS is_compilation
+            FROM release_format rf
+            JOIN artist_releases ar ON ar.id = rf.release_id
+           GROUP BY rf.release_id
+        )
+        SELECT ar.id, ar.title, ar.year, ar.country,
                (SELECT STRING_AGG(DISTINCT label_name, '; ')
-                  FROM release_label rl WHERE rl.release_id = r.id) AS labels,
-               (SELECT STRING_AGG(DISTINCT rf.descriptions, ' | ')
-                  FROM release_format rf WHERE rf.release_id = r.id
-                    AND rf.descriptions ILIKE '%Compilation%') AS format_descriptions
-          FROM release_artist ra
-          JOIN release r ON r.id = ra.release_id
-         WHERE ra.artist_id = ?
-           AND EXISTS (
-             SELECT 1 FROM release_format rf
-              WHERE rf.release_id = r.id
-                AND rf.descriptions ILIKE '%Compilation%'
-                AND (rf.descriptions NOT ILIKE '%Unofficial%' OR rf.descriptions IS NULL)
-           )
-         ORDER BY year NULLS LAST, r.title
+                  FROM release_label rl WHERE rl.release_id = ar.id) AS labels,
+               ci.format_descriptions
+          FROM artist_releases ar
+          JOIN compilation_info ci ON ci.release_id = ar.id
+         WHERE ci.is_compilation
+         ORDER BY ar.year NULLS LAST, ar.title
          LIMIT 500
         """,
         [artist_id],
