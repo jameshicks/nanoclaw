@@ -465,12 +465,25 @@ def run_readonly_sql(query: str, row_limit: int = 1000) -> dict:
     """Escape hatch: run an ad-hoc SELECT against the DB. Enforced constraints:
     exactly one statement; must be SELECT (WITH permitted); no `duckdb_*` catalog
     tables; no information_schema. `row_limit` clamped to [1, 10000]. Returns
-    `{columns, rows, row_count}` on success or `{error, query}` on failure."""
+    `{columns, rows, row_count}` on success or `{error, query}` on failure. A
+    non-fatal `hint` field is added when the query pattern looks slow.
+
+    Perf note: `LIKE '%x%'` / `ILIKE '%x%'` (wildcard prefix) on `artist.name`,
+    `artist.realname`, `release.title`, or `label.name` forces a full table
+    scan — often >1s on 10M+ artists / 19M releases. Those columns have
+    FTS/BM25 indexes; use `search_artist`, `search_release`, `search_label`
+    instead for name/title search. LIKE is fine on free-text columns like
+    `release.notes` or `artist.profile` (not indexed, no alternative)."""
     try:
         sql_guard.validate(query)
     except ValueError as e:
         return {"error": str(e), "query": query}
-    return Q.run_readonly_sql(_CONN, query, int(row_limit))
+    result = Q.run_readonly_sql(_CONN, query, int(row_limit))
+    if "error" not in result:
+        hint = sql_guard.lint_slow_patterns(query)
+        if hint:
+            result["hint"] = hint
+    return result
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """sqlglot-based validator for run_readonly_sql. Read-only DuckDB connection is the real guard;
 this exists for nicer error messages and to stop obvious catalog-snooping before the DB sees it."""
 
+from typing import Optional
+
 import sqlglot
 from sqlglot import exp
 
@@ -59,3 +61,50 @@ def validate(query: str) -> None:
             raise ValueError(f"banned function: {fn_name}")
         if fn_name in {"attach", "detach", "load_aws_credentials"}:
             raise ValueError(f"banned function: {fn_name}")
+
+
+# Columns that have FTS/BM25 indexes built by setup_fts.py. A wildcard-prefix
+# LIKE/ILIKE against these forces a full table scan; the corresponding search_*
+# tool will be orders of magnitude faster.
+_FTS_HINTS = {
+    "name": "search_artist / search_label",
+    "realname": "search_artist",
+    "title": "search_release",
+}
+
+
+def lint_slow_patterns(query: str) -> Optional[str]:
+    """Return a hint string when the query contains a wildcard-prefix LIKE/ILIKE
+    on an FTS-indexed column. Non-FTS columns (notes, profile, role, ...) are
+    left alone — they have no faster alternative. Returns None otherwise."""
+    try:
+        trees = sqlglot.parse(query, read="duckdb")
+    except Exception:
+        return None
+    tree = trees[0] if trees else None
+    if tree is None:
+        return None
+
+    for like in list(tree.find_all(exp.Like)) + list(tree.find_all(exp.ILike)):
+        rhs = like.expression
+        if not isinstance(rhs, exp.Literal) or not rhs.is_string:
+            continue
+        val = rhs.this
+        if not isinstance(val, str) or not val.startswith("%"):
+            continue
+
+        col_expr = like.this
+        while isinstance(col_expr, (exp.Lower, exp.Upper)):
+            col_expr = col_expr.this
+        if not isinstance(col_expr, exp.Column):
+            continue
+
+        col_name = (col_expr.name or "").lower()
+        if col_name in _FTS_HINTS:
+            tool = _FTS_HINTS[col_name]
+            return (
+                f"wildcard-prefix LIKE/ILIKE on `{col_name}` is a full table scan; "
+                f"for name/title search prefer `{tool}` (FTS/BM25-indexed). "
+                f"`run_readonly_sql` still ran your query."
+            )
+    return None
