@@ -1,4 +1,4 @@
-"""Discogs DuckDB MCP server. Exposes 15 tools over FastMCP HTTP on port 8765.
+"""Discogs DuckDB MCP server. Exposes 16 tools over FastMCP HTTP on port 8765.
 
 Expects a read-only DuckDB file at /data/discogs.duckdb (override with DISCOGS_DB_PATH)
 with FTS indexes already built via setup_fts.py. Fails fast at import if either is missing.
@@ -222,6 +222,22 @@ def get_release(release_id: int) -> Optional[dict]:
 
 @mcp.tool
 @_log_call
+def get_release_credits(release_id: int) -> Optional[dict]:
+    """Personnel / credits for a release — who played on it, who produced it,
+    who's credited in any role. Returns `{release_id, title, released_year,
+    primary, additional}` where `primary` are the header artists (extra=0) and
+    `additional` are everyone else credited (producers, remixers, engineers,
+    featured artists, mastering, etc.). Each credit row: artist_id, artist_name,
+    anv (artist-name-variation as printed on the sleeve), role, position,
+    join_string, tracks (track positions if scoped to specific tracks).
+    Use this instead of `get_release` when you only need personnel — response
+    is much smaller since it omits tracklist, formats, labels, genres, styles,
+    identifiers."""
+    return Q.get_release_credits(_CONN, int(release_id))
+
+
+@mcp.tool
+@_log_call
 def get_label(label_id: int) -> Optional[dict]:
     """Full label record including parent_id/parent_name (if a sublabel) and its
     own sublabels."""
@@ -413,6 +429,7 @@ Unofficial marker and are bootlegs.
 
 - "who is X? what did they release?" → `search_artist` → `get_artist_discography`
 - "tell me about this record" → `search_release` → `get_release`
+- "who played on / who produced / credits for a release" → `get_release_credits`
 - "what does this label put out?" → `search_label` → `get_label_releases` (titles) or
   `get_label_roster` (artists + counts)
 - "who has X worked with?" → `find_collaborators`

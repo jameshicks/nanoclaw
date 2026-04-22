@@ -376,6 +376,36 @@ def get_release(conn, release_id: int) -> Optional[dict]:
     }
 
 
+def get_release_credits(conn, release_id: int) -> Optional[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT r.id AS release_id, r.title, r.released_year,
+          (SELECT LIST({'artist_id': artist_id, 'artist_name': artist_name,
+                        'anv': anv, 'position': position,
+                        'join_string': join_string, 'role': role, 'tracks': tracks,
+                        'extra': extra}
+                       ORDER BY extra, position)
+             FROM release_artist WHERE release_id = r.id) AS credits
+          FROM release r WHERE r.id = ?
+        """,
+        [release_id],
+    )
+    row = _one(cur)
+    if row is None:
+        return None
+    creds = row["credits"] or []
+    primary = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 0]
+    additional = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 1]
+    return {
+        "release_id": row["release_id"],
+        "title": row["title"],
+        "released_year": row["released_year"],
+        "primary": primary,
+        "additional": additional,
+    }
+
+
 def get_label(conn, label_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
