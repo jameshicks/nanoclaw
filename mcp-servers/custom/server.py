@@ -278,6 +278,7 @@ def get_label_releases(
     label_id: int,
     year_range: Optional[list[int]] = None,
     unique_masters_only: bool = True,
+    include_credits: bool = False,
 ) -> list[dict]:
     """Releases issued on this label. Each row: id, title, year, country,
     master_id, catno (Discogs catalog number), primary_artists, pressings_count.
@@ -285,12 +286,18 @@ def get_label_releases(
     `unique_masters_only=True` (default) collapses pressings/editions to one
     row per Discogs master — essential for label narratives since labels
     re-press and re-release heavily across territories. Capped at 500 rows.
-    For roster-level aggregates use `get_label_roster` instead."""
+    `include_credits=True` attaches `credits: {primary, additional}` per
+    release — same shape as `get_release_credits` — so you can get a whole
+    label's discography with full personnel in one call instead of walking
+    releases one by one. Response can be large on prolific labels; combine
+    with `year_range` or a sublabel id to scope it. For roster-level
+    aggregates use `get_label_roster` instead."""
     return Q.get_label_releases(
         _CONN,
         int(label_id),
         _year_range(year_range),
         bool(unique_masters_only),
+        bool(include_credits),
     )
 
 
@@ -431,7 +438,8 @@ Unofficial marker and are bootlegs.
 - "tell me about this record" → `search_release` → `get_release`
 - "who played on / who produced / credits for a release" → `get_release_credits`
 - "what does this label put out?" → `search_label` → `get_label_releases` (titles) or
-  `get_label_roster` (artists + counts)
+  `get_label_roster` (artists + counts). Add `include_credits=True` to
+  `get_label_releases` for full personnel per release in one call.
 - "who has X worked with?" → `find_collaborators`
 - "are X and Y connected via collaborators?" → `find_path_between_artists`
 - "snapshot of a scene" (by label, year, country) → `get_scene_snapshot`

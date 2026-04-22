@@ -630,6 +630,7 @@ def get_label_releases(
     label_id: int,
     year_range: Optional[tuple[int, int]],
     unique_masters_only: bool = True,
+    include_credits: bool = False,
 ) -> list[dict]:
     clauses = ["rl.label_id = ?"]
     params: list[Any] = [label_id]
@@ -639,6 +640,21 @@ def get_label_releases(
         params.extend([int(lo), int(hi)])
     where = " AND ".join(clauses)
     cur = conn.cursor()
+
+    credits_cte = """,
+            credits_agg AS (
+              SELECT ra.release_id,
+                     LIST({'artist_id': ra.artist_id, 'artist_name': ra.artist_name,
+                           'anv': ra.anv, 'role': ra.role, 'position': ra.position,
+                           'join_string': ra.join_string, 'tracks': ra.tracks,
+                           'extra': ra.extra}
+                          ORDER BY ra.extra, ra.position) AS credits
+                FROM release_artist ra
+                JOIN top_rows t ON t.id = ra.release_id
+               GROUP BY ra.release_id
+            )""" if include_credits else ""
+    credits_select = ", ca.credits" if include_credits else ""
+    credits_join = "LEFT JOIN credits_agg ca ON ca.release_id = t.id" if include_credits else ""
 
     # `catno` can have multiple distinct values per (release, label) in rare
     # cases (different sides/discs carrying different cat numbers). Join them
@@ -677,16 +693,19 @@ def get_label_releases(
                 JOIN top_rows t ON t.id = ra.release_id
                WHERE ra.extra = 0
                GROUP BY ra.release_id
-            )
+            ){credits_cte}
             SELECT t.id, t.title, t.year, t.country, t.master_id,
-                   t.catno, t.pressings_count, aa.primary_artists
+                   t.catno, t.pressings_count, aa.primary_artists{credits_select}
               FROM top_rows t
               LEFT JOIN artists_agg aa ON aa.release_id = t.id
+              {credits_join}
              ORDER BY t.year NULLS LAST, t.title
             """,
             params,
         )
     else:
+        # In the non-unique-masters branch the CTE name is `base`, not `top_rows`.
+        credits_cte_base = credits_cte.replace("JOIN top_rows t", "JOIN base t")
         cur.execute(
             f"""
             WITH base AS (
@@ -706,16 +725,25 @@ def get_label_releases(
                 JOIN base b ON b.id = ra.release_id
                WHERE ra.extra = 0
                GROUP BY ra.release_id
-            )
+            ){credits_cte_base}
             SELECT b.id, b.title, b.year, b.country, b.master_id,
-                   b.catno, aa.primary_artists
+                   b.catno, aa.primary_artists{credits_select.replace('ca.credits', 'ca.credits')}
               FROM base b
               LEFT JOIN artists_agg aa ON aa.release_id = b.id
+              {credits_join.replace('t.id', 'b.id')}
              ORDER BY b.year NULLS LAST, b.title
             """,
             params,
         )
-    return _rows(cur)
+
+    rows = _rows(cur)
+    if include_credits:
+        for row in rows:
+            creds = row.get("credits") or []
+            primary = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 0]
+            additional = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 1]
+            row["credits"] = {"primary": primary, "additional": additional}
+    return rows
 
 
 def get_label_roster(
