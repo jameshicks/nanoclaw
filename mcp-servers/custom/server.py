@@ -155,6 +155,10 @@ except Exception as e:
 
 _CONN.execute("SET memory_limit='8GB'")
 _CONN.execute("SET threads=4")
+# /data is mounted read-only, so DuckDB's default spill dir ({dbfile}.tmp)
+# fails when complex queries need to spill. Redirect to /tmp, which is
+# writable inside the container.
+_CONN.execute("SET temp_directory='/tmp/duckdb'")
 
 _CONN = _ConnProxy(_CONN)
 
