@@ -468,6 +468,17 @@ def run_readonly_sql(query: str, row_limit: int = 1000) -> dict:
     `{columns, rows, row_count}` on success or `{error, query}` on failure. A
     non-fatal `hint` field is added when the query pattern looks slow.
 
+    Schema: every table name is SINGULAR. Core entities: `artist`, `release`,
+    `label`, `master`. Release children: `release_artist`, `release_label`,
+    `release_track`, `release_track_artist`, `release_format`, `release_genre`,
+    `release_style`, `release_identifier`, `release_company`, `release_video`.
+    Master children: `master_artist`, `master_genre`, `master_style`,
+    `master_video`. Artist extras: `artist_alias`, `artist_namevariation`,
+    `artist_url`, `group_member`. Label extras: `label_url`. Tables named
+    `*_image` are empty (Discogs strips images from the public dump). Call
+    `describe_schema` for the full orientation — entity semantics, the
+    `extra` flag on credits, and how years/compilations are modeled.
+
     Perf note: `LIKE '%x%'` / `ILIKE '%x%'` (wildcard prefix) on `artist.name`,
     `artist.realname`, `release.title`, or `label.name` forces a full table
     scan — often >1s on 10M+ artists / 19M releases. Those columns have
