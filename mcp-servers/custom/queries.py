@@ -300,33 +300,15 @@ def get_artist(conn, artist_id: int, compact: bool = False) -> Optional[dict]:
 
 
 def get_release(conn, release_id: int) -> Optional[dict]:
-    # One query, many LIST subqueries. Nested struct LIST for tracklist -> credits
-    # so the whole release fans out in a single round-trip. Empty subqueries come
-    # back as NULL; normalize to [] below.
+    # Split into three queries. A single-SELECT design with LIST subqueries used
+    # to work, but the double-correlated LIST-of-tracks-with-LIST-of-credits
+    # triggers a cartesian blowup in DuckDB's planner (OOMs at 7+ GiB on a
+    # 7-track release). The single-level LIST subqueries decorrelate fine, so
+    # we keep those inline; only the tracklist moves to a separate fetch.
     cur = conn.cursor()
     cur.execute(
         """
         SELECT r.id, r.title, r.released_year, r.country, r.notes, r.master_id,
-          (SELECT LIST({
-                    'track_id': t.track_id,
-                    'sequence': t.sequence,
-                    'position': t.position,
-                    'parent': t.parent,
-                    'title': t.title,
-                    'duration': t.duration,
-                    'credits': (SELECT LIST({'artist_id': ta.artist_id,
-                                             'artist_name': ta.artist_name,
-                                             'extra': ta.extra,
-                                             'anv': ta.anv,
-                                             'position': ta.position,
-                                             'join_string': ta.join_string,
-                                             'role': ta.role}
-                                            ORDER BY ta.extra, ta.position)
-                                  FROM release_track_artist ta
-                                 WHERE ta.release_id = t.release_id
-                                   AND ta.track_id = t.track_id)
-                 } ORDER BY t.sequence, t.position)
-             FROM release_track t WHERE t.release_id = r.id) AS tracklist,
           (SELECT LIST({'artist_id': artist_id, 'artist_name': artist_name,
                         'extra': extra, 'anv': anv, 'position': position,
                         'join_string': join_string, 'role': role, 'tracks': tracks}
@@ -353,13 +335,37 @@ def get_release(conn, release_id: int) -> Optional[dict]:
     if row is None:
         return None
 
+    cur.execute(
+        """
+        SELECT track_id, sequence, position, parent, title, duration
+          FROM release_track
+         WHERE release_id = ?
+         ORDER BY sequence, position
+        """,
+        [release_id],
+    )
+    tracks = _rows(cur)
+
+    cur.execute(
+        """
+        SELECT track_id, artist_id, artist_name, extra, anv, position,
+               join_string, role
+          FROM release_track_artist
+         WHERE release_id = ?
+         ORDER BY track_id, extra, position
+        """,
+        [release_id],
+    )
+    track_credits: dict[Any, list] = {}
+    for ta in _rows(cur):
+        tid = ta.pop("track_id")
+        track_credits.setdefault(tid, []).append(ta)
+    for t in tracks:
+        t["credits"] = track_credits.get(t["track_id"], [])
+
     release = {k: row[k] for k in (
         "id", "title", "released_year", "country", "notes", "master_id",
     )}
-    tracks = row["tracklist"] or []
-    for t in tracks:
-        if t.get("credits") is None:
-            t["credits"] = []
     creds = row["credits"] or []
     primary = [c for c in creds if c["extra"] == 0]
     additional = [c for c in creds if c["extra"] == 1]
