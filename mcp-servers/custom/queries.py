@@ -299,23 +299,24 @@ def get_artist(conn, artist_id: int, compact: bool = False) -> Optional[dict]:
     return artist
 
 
-def get_release(conn, release_id: int) -> Optional[dict]:
+def get_release(conn, release_id: int, include_notes: bool = False) -> Optional[dict]:
     # Split into three queries. A single-SELECT design with LIST subqueries used
     # to work, but the double-correlated LIST-of-tracks-with-LIST-of-credits
     # triggers a cartesian blowup in DuckDB's planner (OOMs at 7+ GiB on a
     # 7-track release). The single-level LIST subqueries decorrelate fine, so
     # we keep those inline; only the tracklist moves to a separate fetch.
     cur = conn.cursor()
+    notes_col = "r.notes" if include_notes else "NULL AS notes"
     cur.execute(
         """
-        SELECT r.id, r.title, r.released_year, r.country, r.notes, r.master_id,
+        SELECT r.id, r.title, r.released_year, r.country, __NOTES__, r.master_id,
           (SELECT LIST({'artist_id': artist_id, 'artist_name': artist_name,
                         'extra': extra, 'anv': anv, 'position': position,
                         'join_string': join_string, 'role': role, 'tracks': tracks}
                        ORDER BY extra, position)
              FROM release_artist WHERE release_id = r.id) AS credits,
-          (SELECT LIST({'name': name, 'qty': qty, 'descriptions': descriptions,
-                        'text_string': text_string} ORDER BY name)
+          (SELECT LIST({'name': name, 'qty': qty, 'descriptions': descriptions}
+                       ORDER BY name)
              FROM release_format WHERE release_id = r.id) AS formats,
           (SELECT LIST({'label_id': label_id, 'label_name': label_name, 'catno': catno}
                        ORDER BY label_name)
@@ -328,7 +329,7 @@ def get_release(conn, release_id: int) -> Optional[dict]:
                        ORDER BY "type", "value")
              FROM release_identifier WHERE release_id = r.id) AS identifiers
           FROM release r WHERE r.id = ?
-        """,
+        """.replace("__NOTES__", notes_col),
         [release_id],
     )
     row = _one(cur)
@@ -359,6 +360,7 @@ def get_release(conn, release_id: int) -> Optional[dict]:
     track_credits: dict[Any, list] = {}
     for ta in _rows(cur):
         tid = ta.pop("track_id")
+        ta.pop("extra", None)
         track_credits.setdefault(tid, []).append(ta)
     for t in tracks:
         t["credits"] = track_credits.get(t["track_id"], [])
@@ -367,8 +369,8 @@ def get_release(conn, release_id: int) -> Optional[dict]:
         "id", "title", "released_year", "country", "notes", "master_id",
     )}
     creds = row["credits"] or []
-    primary = [c for c in creds if c["extra"] == 0]
-    additional = [c for c in creds if c["extra"] == 1]
+    primary = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 0]
+    additional = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 1]
 
     return {
         "release": release,
@@ -412,13 +414,15 @@ def get_release_credits(conn, release_id: int) -> Optional[dict]:
     }
 
 
-def get_label(conn, label_id: int) -> Optional[dict]:
+def get_label(conn, label_id: int, compact: bool = False) -> Optional[dict]:
     cur = conn.cursor()
+    cols = (
+        "id, name, parent_id, parent_name"
+        if compact
+        else "id, name, contact_info, profile, parent_id, parent_name"
+    )
     cur.execute(
-        """
-        SELECT id, name, contact_info, profile, parent_id, parent_name
-          FROM label WHERE id = ?
-        """,
+        f"SELECT {cols} FROM label WHERE id = ?",
         [label_id],
     )
     label = _one(cur)
@@ -549,10 +553,11 @@ def get_artist_discography(
     cur = conn.cursor()
 
     # Deterministic aggregates per (artist, release):
-    #   role  — join all distinct roles ("Producer; Written-By") so multi-role
-    #           credits don't get truncated to an arbitrary pick.
-    #   extra — MIN: if any credit on this release is primary (0), the release
-    #           is primary for this artist.
+    #   role       — join all distinct roles ("Producer; Written-By") so
+    #                multi-role credits don't get truncated to an arbitrary pick.
+    #   as_primary — true iff at least one credit on this release is primary
+    #                (ra.extra=0). Distinguishes "the artist's own release" from
+    #                "contributor-only appearance" (comps, guest credits, etc.).
     if unique_masters_only:
         # Collapse to one row per master (earliest-year, lowest-id pressing).
         # Standalone releases (master_id IS NULL) keyed by -id — Discogs IDs
@@ -562,7 +567,7 @@ def get_artist_discography(
             WITH releases AS (
               SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
                      STRING_AGG(DISTINCT ra.role, '; ' ORDER BY ra.role) AS role,
-                     MIN(ra.extra) AS extra
+                     MIN(ra.extra) = 0 AS as_primary
                 FROM release_artist ra
                 JOIN release r ON r.id = ra.release_id
                WHERE {where}
@@ -578,7 +583,7 @@ def get_artist_discography(
                 FROM releases
             ),
             top_rows AS (
-              SELECT id, title, year, country, master_id, role, extra, pressings_count
+              SELECT id, title, year, country, master_id, role, as_primary, pressings_count
                 FROM deduped
                WHERE _rank = 1
                ORDER BY year NULLS LAST, title
@@ -592,7 +597,7 @@ def get_artist_discography(
                GROUP BY rl.release_id
             )
             SELECT t.id, t.title, t.year, t.country, t.master_id,
-                   t.role, t.extra, t.pressings_count, la.labels
+                   t.role, t.as_primary, t.pressings_count, la.labels
               FROM top_rows t
               LEFT JOIN labels_agg la ON la.release_id = t.id
              ORDER BY t.year NULLS LAST, t.title
@@ -605,7 +610,7 @@ def get_artist_discography(
             WITH base AS (
               SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
                      STRING_AGG(DISTINCT ra.role, '; ' ORDER BY ra.role) AS role,
-                     MIN(ra.extra) AS extra
+                     MIN(ra.extra) = 0 AS as_primary
                 FROM release_artist ra
                 JOIN release r ON r.id = ra.release_id
                WHERE {where}
@@ -621,7 +626,7 @@ def get_artist_discography(
                GROUP BY rl.release_id
             )
             SELECT b.id, b.title, b.year, b.country, b.master_id,
-                   b.role, b.extra, la.labels
+                   b.role, b.as_primary, la.labels
               FROM base b
               LEFT JOIN labels_agg la ON la.release_id = b.id
              ORDER BY b.year NULLS LAST, b.title
@@ -647,17 +652,26 @@ def get_label_releases(
     where = " AND ".join(clauses)
     cur = conn.cursor()
 
+    # Summary-only: role → [artist_name]. Primary artists are already in
+    # `primary_artists`; this aggregates extra (non-primary) credits grouped
+    # by role. For per-track detail, anv, join_string, etc., call
+    # get_release_credits(release_id) on the specific release.
     credits_cte = """,
-            credits_agg AS (
-              SELECT ra.release_id,
-                     LIST({'artist_id': ra.artist_id, 'artist_name': ra.artist_name,
-                           'anv': ra.anv, 'role': ra.role, 'position': ra.position,
-                           'join_string': ra.join_string, 'tracks': ra.tracks,
-                           'extra': ra.extra}
-                          ORDER BY ra.extra, ra.position) AS credits
+            credits_per_role AS (
+              SELECT ra.release_id, ra.role,
+                     LIST(DISTINCT ra.artist_name ORDER BY ra.artist_name) AS artists
                 FROM release_artist ra
                 JOIN top_rows t ON t.id = ra.release_id
-               GROUP BY ra.release_id
+               WHERE ra.extra = 1
+                 AND ra.role IS NOT NULL
+                 AND TRIM(ra.role) <> ''
+               GROUP BY ra.release_id, ra.role
+            ),
+            credits_agg AS (
+              SELECT release_id,
+                     LIST({'role': role, 'artists': artists} ORDER BY role) AS credits
+                FROM credits_per_role
+               GROUP BY release_id
             )""" if include_credits else ""
     credits_select = ", ca.credits" if include_credits else ""
     credits_join = "LEFT JOIN credits_agg ca ON ca.release_id = t.id" if include_credits else ""
@@ -745,10 +759,8 @@ def get_label_releases(
     rows = _rows(cur)
     if include_credits:
         for row in rows:
-            creds = row.get("credits") or []
-            primary = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 0]
-            additional = [{k: v for k, v in c.items() if k != "extra"} for c in creds if c["extra"] == 1]
-            row["credits"] = {"primary": primary, "additional": additional}
+            entries = row.get("credits") or []
+            row["credits"] = {e["role"]: e["artists"] for e in entries}
     return rows
 
 

@@ -217,11 +217,13 @@ def get_artist(artist_id: int, compact: bool = False) -> Optional[dict]:
 
 @mcp.tool
 @_log_call
-def get_release(release_id: int) -> Optional[dict]:
+def get_release(release_id: int, include_notes: bool = False) -> Optional[dict]:
     """Full release record: tracklist (each track with its track-level credits),
     release-level credits (split into primary / additional by Discogs `extra` flag),
-    formats, labels, genres, styles, identifiers."""
-    return Q.get_release(_CONN, int(release_id))
+    formats, labels, genres, styles, identifiers. `include_notes=True` pulls
+    `r.notes` (free-text release notes, often the largest single field) — leave
+    off unless the user specifically asks about liner notes or release commentary."""
+    return Q.get_release(_CONN, int(release_id), bool(include_notes))
 
 
 @mcp.tool
@@ -242,10 +244,12 @@ def get_release_credits(release_id: int) -> Optional[dict]:
 
 @mcp.tool
 @_log_call
-def get_label(label_id: int) -> Optional[dict]:
+def get_label(label_id: int, compact: bool = False) -> Optional[dict]:
     """Full label record including parent_id/parent_name (if a sublabel) and its
-    own sublabels."""
-    return Q.get_label(_CONN, int(label_id))
+    own sublabels. `compact=True` omits `profile` and `contact_info` (the
+    free-text bio and address/contact block, often the largest fields) — use
+    for overview scans when you only need structured fields."""
+    return Q.get_label(_CONN, int(label_id), bool(compact))
 
 
 @mcp.tool
@@ -260,12 +264,15 @@ def get_artist_discography(
     """Releases crediting this artist. `role` accepts "performer" (empty role),
     "producer", "writer", "engineer" as grouped aliases; any other string is a
     substring ILIKE match against release_artist.role. `as_main_only=True`
-    restricts to primary credits (extra=0). `year_range=[lo, hi]` filters on
-    released_year (releases with NULL year are excluded). `unique_masters_only=True`
-    (default) collapses pressings/editions to one row per Discogs master, picking
-    the earliest-year pressing; each row carries `pressings_count` for how many
-    variants it represents. Set False to see every pressing (can explode for
-    prolific artists). Capped at 500 rows."""
+    restricts to primary credits only. Each row carries `as_primary` (bool) —
+    true iff the artist is credited as a header/primary on the release, false
+    for contributor-only appearances (comps, guest credits, etc.).
+    `year_range=[lo, hi]` filters on released_year (releases with NULL year
+    are excluded). `unique_masters_only=True` (default) collapses
+    pressings/editions to one row per Discogs master, picking the earliest-year
+    pressing; each row carries `pressings_count` for how many variants it
+    represents. Set False to see every pressing (can explode for prolific
+    artists). Capped at 500 rows."""
     return Q.get_artist_discography(
         _CONN,
         int(artist_id),
@@ -290,12 +297,13 @@ def get_label_releases(
     `unique_masters_only=True` (default) collapses pressings/editions to one
     row per Discogs master — essential for label narratives since labels
     re-press and re-release heavily across territories. Capped at 500 rows.
-    `include_credits=True` attaches `credits: {primary, additional}` per
-    release — same shape as `get_release_credits` — so you can get a whole
-    label's discography with full personnel in one call instead of walking
-    releases one by one. Response can be large on prolific labels; combine
-    with `year_range` or a sublabel id to scope it. For roster-level
-    aggregates use `get_label_roster` instead."""
+    `include_credits=True` attaches `credits: {role: [artist_name, ...]}`
+    per release — a role → names summary of non-primary contributors only
+    (primary artists are already in `primary_artists`). For per-track
+    detail, anv/stage names, or join strings, call
+    `get_release_credits(release_id)` on the specific release. Combine
+    with `year_range` or a sublabel id to scope large catalogs. For
+    roster-level aggregates use `get_label_roster` instead."""
     return Q.get_label_releases(
         _CONN,
         int(label_id),
@@ -443,7 +451,8 @@ Unofficial marker and are bootlegs.
 - "who played on / who produced / credits for a release" → `get_release_credits`
 - "what does this label put out?" → `search_label` → `get_label_releases` (titles) or
   `get_label_roster` (artists + counts). Add `include_credits=True` to
-  `get_label_releases` for full personnel per release in one call.
+  `get_label_releases` for a role→names summary per release; fan out to
+  `get_release_credits` for the handful that warrant full detail.
 - "who has X worked with?" → `find_collaborators`
 - "are X and Y connected via collaborators?" → `find_path_between_artists`
 - "snapshot of a scene" (by label, year, country) → `get_scene_snapshot`
