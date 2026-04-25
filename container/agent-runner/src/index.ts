@@ -613,9 +613,19 @@ async function runQuery(
       resultCount++;
       const textResult =
         'result' in message ? (message as { result?: string }).result : null;
+      // Subagent completions surface as `result` messages too, but only the
+      // main-thread result should be relayed to the user. Subagents carry a
+      // non-null parent_tool_use_id (the Task tool call that spawned them);
+      // the field isn't declared on SDKResultSuccess so we read it loosely.
+      const parentToolUseId = (
+        message as unknown as { parent_tool_use_id?: string | null }
+      ).parent_tool_use_id;
+      const isSubagentResult =
+        parentToolUseId !== undefined && parentToolUseId !== null;
       log(
-        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+        `Result #${resultCount}: subtype=${message.subtype}${isSubagentResult ? ` subagent_parent=${parentToolUseId}` : ''}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      if (isSubagentResult) continue;
       writeOutput({
         status: 'success',
         result: textResult || null,
