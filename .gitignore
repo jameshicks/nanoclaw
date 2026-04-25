@@ -6,8 +6,24 @@ dist/
 
 # Local data & auth
 store/
-data/
 logs/
+
+# data/ is mostly local state, but track personal session customizations
+# (per-group .claude/agents/ and .claude/skills/)
+data/*
+!data/sessions/
+data/sessions/*
+!data/sessions/*/
+data/sessions/*/*
+!data/sessions/*/.claude/
+data/sessions/*/.claude/*
+!data/sessions/*/.claude/agents/
+!data/sessions/*/.claude/skills/
+# Skills auto-synced from container/skills/ — don't double-track
+data/sessions/*/.claude/skills/agent-browser/
+data/sessions/*/.claude/skills/capabilities/
+data/sessions/*/.claude/skills/slack-formatting/
+data/sessions/*/.claude/skills/status/
 
 # Groups - only track base structure and specific CLAUDE.md files
 groups/*
