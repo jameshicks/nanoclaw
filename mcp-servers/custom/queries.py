@@ -56,8 +56,47 @@ def _sql_normalize(col: str) -> str:
 # -------- Search (FTS-backed) --------
 
 
-def search_artist(conn, name: str, limit: int) -> list[dict]:
+def _exact_artist(conn, name: str, limit: int) -> list[dict]:
+    """Exact-name resolution: skip BM25 and the labels/years enrichment, match
+    name directly. Returns only id/name/realname — a cheap, precise lookup for
+    when the caller already knows the entity name.
+
+    Two-step so the common case stays fast: a raw case-insensitive match first
+    (a plain scan, ~1s), and only if that finds nothing do we pay for the
+    normalized form that bridges "&"/"and" and Discogs "(2)" disambiguators
+    (the regex normalize over every row roughly triples the cost)."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, name, realname
+          FROM artist
+         WHERE LOWER(name) = LOWER(?)
+         ORDER BY LENGTH(name) ASC
+         LIMIT ?
+        """,
+        [name, limit],
+    )
+    rows = _rows(cur)
+    if rows:
+        return rows
+    name_norm_sql = _sql_normalize("name")
+    cur.execute(
+        f"""
+        SELECT id, name, realname
+          FROM artist
+         WHERE {name_norm_sql} = ?
+         ORDER BY LENGTH(name) ASC
+         LIMIT ?
+        """,
+        [_normalize_name(name), limit],
+    )
+    return _rows(cur)
+
+
+def search_artist(conn, name: str, limit: int, exact: bool = False) -> list[dict]:
     limit = _clamp(limit, 1, 100)
+    if exact:
+        return _exact_artist(conn, name, limit)
     # Pull a wider FTS candidate set, then re-rank in three tiers:
     #   0 — raw lowercase name matches the query verbatim (canonical entity
     #       always wins here — "Aphex Twin" beats "Aphex Twin (69)")
@@ -217,8 +256,48 @@ def search_release(
     return _rows(cur)
 
 
-def search_label(conn, name: str, limit: int) -> list[dict]:
+def _exact_label(conn, name: str, limit: int) -> list[dict]:
+    """Exact-name label resolution: skip BM25, match name directly. Returns
+    id/name/parent_name and release_count — the count directly informs the
+    "stub a label only if it has more than one release" rule, without a
+    follow-up call. Two-step (raw case-insensitive first, normalized only on a
+    miss) to keep the common case fast."""
+    count_sql = (
+        "(SELECT COUNT(*) FROM release_label rl WHERE rl.label_id = l.id)"
+        " AS release_count"
+    )
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT l.id, l.name, l.parent_name, {count_sql}
+          FROM label l
+         WHERE LOWER(l.name) = LOWER(?)
+         ORDER BY LENGTH(l.name) ASC
+         LIMIT ?
+        """,
+        [name, limit],
+    )
+    rows = _rows(cur)
+    if rows:
+        return rows
+    name_norm_sql = _sql_normalize("l.name")
+    cur.execute(
+        f"""
+        SELECT l.id, l.name, l.parent_name, {count_sql}
+          FROM label l
+         WHERE {name_norm_sql} = ?
+         ORDER BY LENGTH(l.name) ASC
+         LIMIT ?
+        """,
+        [_normalize_name(name), limit],
+    )
+    return _rows(cur)
+
+
+def search_label(conn, name: str, limit: int, exact: bool = False) -> list[dict]:
     limit = _clamp(limit, 1, 100)
+    if exact:
+        return _exact_label(conn, name, limit)
     fts_fetch = max(limit * 5, 50)
     norm_query = _normalize_name(name)
     hits_norm_sql = _sql_normalize("name")
@@ -447,6 +526,52 @@ def get_label(conn, label_id: int, compact: bool = False) -> Optional[dict]:
 # -------- Traversal --------
 
 
+# Discogs "special" placeholder artists — not real entities. They carry enormous
+# credit counts (Various alone: ~1.3M primary credits), so admitting them into
+# the collaboration self-join both explodes the join and produces meaningless
+# edges ("everyone collaborated with Various"). Excluded from every graph
+# traversal, on both the seed and neighbor sides. Keep in sync with
+# build_edge_table.py.
+SPECIAL_ARTIST_IDS = (194, 355, 118760)  # Various, Unknown Artist, No Artist
+_SPECIAL_IDS_SQL = ", ".join(str(i) for i in SPECIAL_ARTIST_IDS)
+
+
+def _not_special(alias: str) -> str:
+    """SQL predicate excluding the special placeholder artists for a table alias."""
+    return f"{alias}.artist_id NOT IN ({_SPECIAL_IDS_SQL})"
+
+
+def _int_in(ids) -> str:
+    """Render an int-id collection as an inline SQL IN-list literal, e.g. '(1, 2, 3)'
+    (empty -> '(NULL)'). Ids are coerced to int, so this is injection-safe.
+
+    Why inline instead of a parameterized `IN (SELECT UNNEST(CAST(? AS BIGINT[])))`:
+    DuckDB can't push the UNNEST-subquery form into the scan as a filter, so the
+    seed-side predicate forces a full scan of the ~90M-row edge table (~13s for a
+    single seed vs ~0.7s inlined). The frontiers here are bounded (<=2000 / capped
+    at 5000) so the IN-list stays a reasonable size."""
+    vals = [str(int(x)) for x in ids]
+    return "(" + ", ".join(vals) + ")" if vals else "(NULL)"
+
+
+# The table the graph self-joins scan. Defaults to the full release_artist;
+# server.py flips this to the narrow `release_artist_slim` projection (built by
+# build_edge_table.py) at startup when present — same columns the self-joins
+# touch, far fewer bytes per row, specials pre-removed.
+EDGE_TABLE = "release_artist"
+
+
+def configure_edge_table(conn) -> str:
+    """Detect the slim edge table and switch the graph queries to it if present.
+    Returns the table name now in use. Called once at server startup."""
+    global EDGE_TABLE
+    exists = conn.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'release_artist_slim'"
+    ).fetchone()
+    EDGE_TABLE = "release_artist_slim" if exists else "release_artist"
+    return EDGE_TABLE
+
+
 # Non-musical role patterns used by the "musical" alias below — package/art
 # direction and business credits that agents generally want to exclude when
 # asking "who played on this?"
@@ -472,12 +597,19 @@ _NON_MUSICAL_PATTERNS = (
 )
 
 
-def _role_predicate(alias: str, key: str) -> tuple[str, list[Any]]:
+def _role_predicate(
+    alias: str, key: str, precomputed_musical: bool = False
+) -> tuple[str, list[Any]]:
     """Build a SQL predicate fragment for role filtering, parameterized by table alias.
 
     Known keys map to curated clauses; anything else becomes a substring ILIKE.
     Returns (sql_fragment, params). Params is empty for curated clauses,
-    non-empty for the substring fallthrough or the "musical" blocklist alias."""
+    non-empty for the substring fallthrough or the "musical" blocklist alias.
+
+    precomputed_musical=True — the alias table carries the is_non_musical boolean
+    (release_artist_slim), so the "musical" blocklist collapses from 18 per-row
+    ILIKEs to a single boolean read. Only pass this for tables built with that
+    column."""
     key = key.strip().lower()
     col = f"{alias}.role"
     if key == "performer":
@@ -495,6 +627,8 @@ def _role_predicate(alias: str, key: str) -> tuple[str, list[Any]]:
             [],
         )
     if key == "musical":
+        if precomputed_musical:
+            return f"({col} IS NULL OR NOT {alias}.is_non_musical)", []
         blocks = " AND ".join(f"{col} NOT ILIKE ?" for _ in _NON_MUSICAL_PATTERNS)
         return f"({col} IS NULL OR ({blocks}))", list(_NON_MUSICAL_PATTERNS)
     if key:
@@ -502,7 +636,9 @@ def _role_predicate(alias: str, key: str) -> tuple[str, list[Any]]:
     return "TRUE", []
 
 
-def _roles_clause(alias: str, roles: Optional[Any]) -> tuple[Optional[str], list[Any]]:
+def _roles_clause(
+    alias: str, roles: Optional[Any], precomputed_musical: bool = False
+) -> tuple[Optional[str], list[Any]]:
     """Normalize roles arg (None | str | list[str]) into an OR-combined predicate
     against the given table alias. Returns (clause_or_None, params)."""
     if roles is None:
@@ -514,7 +650,7 @@ def _roles_clause(alias: str, roles: Optional[Any]) -> tuple[Optional[str], list
     frags: list[str] = []
     params: list[Any] = []
     for r in roles:
-        frag, fp = _role_predicate(alias, r)
+        frag, fp = _role_predicate(alias, r, precomputed_musical)
         if frag == "TRUE":
             continue
         frags.append(frag)
@@ -809,7 +945,12 @@ def find_collaborators(
     depth = _clamp(depth, 1, 3)
     min_shared = max(1, int(min_shared_releases))
 
-    role_clause, role_params = _roles_clause("ra2", roles)
+    # The slim edge table carries the precomputed is_non_musical boolean, so the
+    # "musical" blocklist becomes a single boolean read instead of 18 ILIKEs per
+    # row of the ~90M-row self-join.
+    role_clause, role_params = _roles_clause(
+        "ra2", roles, precomputed_musical=(EDGE_TABLE == "release_artist_slim")
+    )
     role_sql = f" AND {role_clause}" if role_clause else ""
 
     visited: set[int] = {artist_id}
@@ -831,15 +972,17 @@ def find_collaborators(
                 WITH edges AS MATERIALIZED (
                   SELECT ra2.artist_id AS neighbor_id, a.name,
                          ra2.release_id, r.title, r.released_year AS year
-                    FROM release_artist ra1
-                    JOIN release_artist ra2
+                    FROM {EDGE_TABLE} ra1
+                    JOIN {EDGE_TABLE} ra2
                       ON ra2.release_id = ra1.release_id
                      AND ra2.artist_id <> ra1.artist_id
                     JOIN release r ON r.id = ra1.release_id
                     LEFT JOIN artist a ON a.id = ra2.artist_id
-                   WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   WHERE ra1.artist_id IN {_int_in(frontier)}
                      AND ra1.extra = 0
-                     AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                     AND {_not_special('ra1')}
+                     AND {_not_special('ra2')}
+                     AND ra2.artist_id NOT IN {_int_in(visited)}
                      {role_sql}
                 ),
                 neighbor_stats AS (
@@ -874,28 +1017,30 @@ def find_collaborators(
                   FROM neighbor_stats ns
                  ORDER BY ns.shared_releases DESC
                 """,
-                [list(frontier), list(visited), *role_params, min_shared],
+                [*role_params, min_shared],
             )
         else:
             cur.execute(
                 f"""
                 SELECT ra2.artist_id, a.name,
                        COUNT(DISTINCT ra2.release_id) AS shared_releases
-                  FROM release_artist ra1
-                  JOIN release_artist ra2
+                  FROM {EDGE_TABLE} ra1
+                  JOIN {EDGE_TABLE} ra2
                     ON ra2.release_id = ra1.release_id
                    AND ra2.artist_id <> ra1.artist_id
                   LEFT JOIN artist a ON a.id = ra2.artist_id
-                 WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                 WHERE ra1.artist_id IN {_int_in(frontier)}
                    AND ra1.extra = 0
-                   AND ra2.artist_id NOT IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                   AND {_not_special('ra1')}
+                   AND {_not_special('ra2')}
+                   AND ra2.artist_id NOT IN {_int_in(visited)}
                    {role_sql}
                  GROUP BY ra2.artist_id, a.name
                 HAVING COUNT(DISTINCT ra2.release_id) >= ?
                  ORDER BY shared_releases DESC
                  LIMIT 2000
                 """,
-                [list(frontier), list(visited), *role_params, min_shared],
+                [*role_params, min_shared],
             )
 
         new_frontier: set[int] = set()
@@ -923,13 +1068,12 @@ def find_collaborators(
     if results:
         neighbor_ids = [r["artist_id"] for r in results]
         cur.execute(
-            """
+            f"""
             SELECT artist_id, alias_artist_id, alias_name
               FROM artist_alias
-             WHERE artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+             WHERE artist_id IN {_int_in(neighbor_ids)}
              ORDER BY artist_id, alias_name
-            """,
-            [neighbor_ids],
+            """
         )
         aliases_by_artist: dict[int, list[dict]] = {}
         for aid, alias_id, alias_name in cur.fetchall():
@@ -981,8 +1125,7 @@ def find_path_between_artists(
             n = parents_b[n]
         full = forward + backward  # A ... meet ... B
         cur.execute(
-            "SELECT id, name FROM artist WHERE id IN (SELECT UNNEST(CAST(? AS BIGINT[])))",
-            [full],
+            f"SELECT id, name FROM artist WHERE id IN {_int_in(full)}"
         )
         name_map = {r[0]: r[1] for r in cur.fetchall()}
         return {
@@ -1008,16 +1151,17 @@ def find_path_between_artists(
 
         if expand_a:
             cur.execute(
-                """
+                f"""
                 SELECT DISTINCT ra1.artist_id AS from_id, ra2.artist_id AS to_id
-                  FROM release_artist ra1
-                  JOIN release_artist ra2
+                  FROM {EDGE_TABLE} ra1
+                  JOIN {EDGE_TABLE} ra2
                     ON ra2.release_id = ra1.release_id
                    AND ra2.artist_id <> ra1.artist_id
-                 WHERE ra1.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                 WHERE ra1.artist_id IN {_int_in(capped(frontier_a))}
                    AND ra1.extra = 0
-                """,
-                [capped(frontier_a)],
+                   AND {_not_special('ra1')}
+                   AND {_not_special('ra2')}
+                """
             )
             new_frontier: set[int] = set()
             for from_id, to_id in cur.fetchall():
@@ -1033,16 +1177,17 @@ def find_path_between_artists(
         else:
             # Backward expand: find predecessors of nodes in frontier_b.
             cur.execute(
-                """
+                f"""
                 SELECT DISTINCT ra1.artist_id AS from_id, ra2.artist_id AS to_id
-                  FROM release_artist ra1
-                  JOIN release_artist ra2
+                  FROM {EDGE_TABLE} ra1
+                  JOIN {EDGE_TABLE} ra2
                     ON ra2.release_id = ra1.release_id
                    AND ra2.artist_id <> ra1.artist_id
-                 WHERE ra2.artist_id IN (SELECT UNNEST(CAST(? AS BIGINT[])))
+                 WHERE ra2.artist_id IN {_int_in(capped(frontier_b))}
                    AND ra1.extra = 0
-                """,
-                [capped(frontier_b)],
+                   AND {_not_special('ra1')}
+                   AND {_not_special('ra2')}
+                """
             )
             new_frontier = set()
             for from_id, to_id in cur.fetchall():
@@ -1208,6 +1353,138 @@ def list_compilations_featuring_artist(conn, artist_id: int) -> list[dict]:
         [artist_id],
     )
     return _rows(cur)
+
+
+def get_release_by_catalog_number(
+    conn,
+    cat_no: str,
+    label_id: Optional[int] = None,
+) -> list[dict]:
+    clauses = ["UPPER(TRIM(rl.catno)) = UPPER(TRIM(?))"]
+    params: list[Any] = [cat_no]
+    if label_id is not None:
+        clauses.append("rl.label_id = ?")
+        params.append(int(label_id))
+    where = " AND ".join(clauses)
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT r.id, r.title, r.released_year AS year, r.country, r.master_id,
+               rl.label_id, rl.label_name, rl.catno,
+               (SELECT STRING_AGG(DISTINCT artist_name, ' / ')
+                  FROM release_artist ra
+                 WHERE ra.release_id = r.id AND ra.extra = 0) AS primary_artists
+          FROM release_label rl
+          JOIN release r ON r.id = rl.release_id
+         WHERE {where}
+         ORDER BY rl.label_id, r.released_year NULLS LAST, r.id
+         LIMIT 100
+        """,
+        params,
+    )
+    return _rows(cur)
+
+
+# Role buckets used by get_label_credits_summary. Order matters — first match
+# wins, so producer comes before engineer (so "Mix Producer" buckets to producer
+# not engineer). "performer" catches NULL/empty roles (the primary credit case).
+_LABEL_CREDITS_BUCKETS_SQL = """
+CASE
+  WHEN ra.role IS NULL OR TRIM(ra.role) = '' THEN 'performer'
+  WHEN ra.role ILIKE '%Producer%' THEN 'producer'
+  WHEN ra.role ILIKE '%Engineer%' OR ra.role ILIKE '%Mix%' OR ra.role ILIKE '%Master%' THEN 'engineer'
+  WHEN ra.role ILIKE '%Written-By%' OR ra.role ILIKE '%Composed%' OR ra.role ILIKE '%Lyrics%' THEN 'writer'
+  WHEN ra.role ILIKE '%Design%' OR ra.role ILIKE '%Photograph%' OR ra.role ILIKE '%Artwork%'
+       OR ra.role ILIKE '%Illustration%' OR ra.role ILIKE '%Sleeve%' OR ra.role ILIKE '%Layout%'
+       OR ra.role ILIKE '%Cover %' THEN 'design'
+  ELSE 'other'
+END
+"""
+
+
+def get_label_credits_summary(
+    conn,
+    label_id: int,
+    year_range: Optional[tuple[int, int]],
+    top_n_per_role: int = 10,
+) -> dict:
+    top_n = _clamp(int(top_n_per_role), 1, 50)
+    clauses = ["rl.label_id = ?"]
+    params: list[Any] = [label_id]
+    if year_range is not None:
+        lo, hi = year_range
+        clauses.append("r.released_year BETWEEN ? AND ?")
+        params.extend([int(lo), int(hi)])
+    where = " AND ".join(clauses)
+
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        WITH label_releases AS (
+          SELECT DISTINCT rl.release_id
+            FROM release_label rl
+            JOIN release r ON r.id = rl.release_id
+           WHERE {where}
+        ),
+        bucketed AS (
+          SELECT ra.artist_id, ra.artist_name, ra.release_id,
+                 CASE WHEN TRIM(COALESCE(ra.role, '')) = '' THEN NULL ELSE ra.role END AS role,
+                 {_LABEL_CREDITS_BUCKETS_SQL} AS bucket
+            FROM release_artist ra
+            JOIN label_releases lr ON lr.release_id = ra.release_id
+        ),
+        per_artist AS (
+          SELECT bucket, artist_id,
+                 MIN(artist_name) AS name,
+                 COUNT(DISTINCT release_id) AS release_count,
+                 STRING_AGG(DISTINCT role, '; ' ORDER BY role) AS roles
+            FROM bucketed
+           GROUP BY bucket, artist_id
+        ),
+        ranked AS (
+          SELECT bucket, artist_id, name, release_count, roles,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY bucket
+                   ORDER BY release_count DESC, name
+                 ) AS rn
+            FROM per_artist
+        )
+        SELECT bucket, artist_id, name, release_count, roles
+          FROM ranked
+         WHERE rn <= ?
+         ORDER BY bucket, release_count DESC, name
+        """,
+        [*params, top_n],
+    )
+    rows = _rows(cur)
+
+    cur.execute("SELECT name FROM label WHERE id = ?", [label_id])
+    label_row = _one(cur)
+
+    cur.execute(
+        f"""
+        SELECT COUNT(DISTINCT rl.release_id) AS n
+          FROM release_label rl
+          JOIN release r ON r.id = rl.release_id
+         WHERE {where}
+        """,
+        params,
+    )
+    rel_count_row = _one(cur)
+    rel_count = rel_count_row["n"] if rel_count_row else 0
+
+    buckets: dict[str, list[dict]] = {}
+    for row in rows:
+        bucket = row.pop("bucket")
+        buckets.setdefault(bucket, []).append(row)
+
+    return {
+        "label_id": label_id,
+        "label_name": label_row["name"] if label_row else None,
+        "release_count": rel_count,
+        "buckets": buckets,
+    }
 
 
 # -------- Escape hatch --------

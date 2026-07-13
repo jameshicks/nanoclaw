@@ -13,10 +13,14 @@ the `custom` key — no `.mcp.json` edits needed.
 | `search_label(name, limit=10)` | FTS fuzzy search |
 | `get_artist(artist_id)` | Full record + aliases, name variations, groups, members |
 | `get_release(release_id)` | Full record + tracklist, credits, formats, genres, styles |
+| `get_release_credits(release_id)` | Personnel only — split into primary / additional. Smaller payload than `get_release`. |
+| `get_release_by_catalog_number(cat_no, label_id=None)` | Direct lookup by Discogs cat# (e.g. `SSQ225`, `S-005`). |
 | `get_label(label_id)` | Full record + parent, sublabels |
 | `get_artist_discography(artist_id, role=None, as_main_only=False, year_range=None, unique_masters_only=True)` | Role aliases: `performer`, `producer`, `writer`, `engineer`. Default collapses pressings to one row per master. |
+| `get_person_credits(person_id, year_range=None, unique_masters_only=True)` | All-roles credit history for a person — defaults tuned for engineer/designer/contributor lookups. |
 | `get_label_releases(label_id, year_range=None, unique_masters_only=True)` | Release-level catalog for a label, with primary_artists and catno per row |
 | `get_label_roster(label_id, year_range=None)` | Primary artists by release count |
+| `get_label_credits_summary(label_id, year_range=None, top_n_per_role=10)` | Top-N people per role bucket (performer/producer/engineer/writer/design/other) across the label's catalog. |
 | `find_collaborators(artist_id, depth=1, min_shared_releases=1, roles=None)` | BFS, depth ≤ 3. `roles` aliases: `musical` (blocklist), `performer`, `producer`, `writer`, `engineer`. Results include `top_shared_titles`. |
 | `find_path_between_artists(a_id, b_id, max_depth=4)` | Shortest path, max_depth ≤ 6 |
 | `get_scene_snapshot(label_ids=None, year_range=None, country=None)` | Multi-dim slice |
@@ -33,6 +37,17 @@ else holds it open.
 ```bash
 python3 -m pip install duckdb
 python3 mcp-servers/custom/setup_fts.py --db-path ~/projects/discogs_db/discogs.duckdb
+# --force to rebuild
+```
+
+Then build the collaboration edge table. Same requirement (writable, nothing else
+holding the file — stop the MCP container first). Takes a few minutes and adds
+~1–2 GB. This backs `find_collaborators` / `find_path_between_artists`; the server
+falls back to the full `release_artist` table (slower) and logs a warning if it's
+absent.
+
+```bash
+python3 mcp-servers/custom/build_edge_table.py --db-path ~/projects/discogs_db/discogs.duckdb
 # --force to rebuild
 ```
 
@@ -73,8 +88,32 @@ extra config required on the agent side.
   neighbors to be any credit. This surfaces producers/remixers/features while keeping the
   graph finite. Both-sides `extra=0` was tried and produced near-empty results for most
   seeds.
+- **Special placeholder artists are excluded from graph traversals.** Discogs `Various`
+  (id 194, ~1.3M primary credits), `Unknown Artist` (355) and `No Artist` (118760) aren't
+  real entities; admitting them into the `find_collaborators` / `find_path_between_artists`
+  self-join both explodes the join and yields meaningless edges. They're filtered on both
+  seed and neighbor sides (`SPECIAL_ARTIST_IDS` in `queries.py`, kept in sync with
+  `build_edge_table.py`).
+- **Graph self-joins run against `release_artist_slim`.** The traversal tools only touch
+  five columns (`release_id, artist_id, extra, role, is_non_musical`); `build_edge_table.py`
+  materializes just those, ordered by `artist_id` (so zone-maps prune the seed-side filter)
+  and with the special artists pre-removed. `find_collaborators` was ~71% of all DB time in
+  the query log. The tool falls back to `release_artist` when the slim table is absent.
+- **Frontier id-sets are inlined into the SQL, not passed as `IN (SELECT UNNEST(CAST(? AS
+  BIGINT[])))`.** DuckDB can't push the UNNEST-subquery form into the scan, so the seed-side
+  predicate forced a full scan of the ~90M-row edge table (~13s per single seed vs ~0.7s
+  inlined — this was the dominant cost, pre-dating the slim table). `_int_in()` renders the
+  bounded, int-coerced frontier as a literal `IN (…)` list. If you add new frontier filters,
+  use it — don't reintroduce the UNNEST form.
+- **The `musical` role blocklist is precomputed into `is_non_musical`.** It used to apply 18
+  `role NOT ILIKE ?` patterns across the whole self-join on every call; `build_edge_table.py`
+  evaluates them once at build time so the filter is a single boolean read. The 18 ILIKE
+  patterns in `NON_MUSICAL_PATTERNS` (build script) must stay in sync with
+  `_NON_MUSICAL_PATTERNS` in `queries.py` (used for the `release_artist` fallback path).
 - **Year-range filters exclude `released_year IS NULL`** (~13% of releases). If agents need
   to include undated releases, use `run_readonly_sql` directly.
+- **DuckDB memory/threads** default to 16GB / 8 threads, overridable via `DUCKDB_MEMORY_LIMIT`
+  / `DUCKDB_THREADS` env vars (host is 12-core/31GB; container is uncapped).
 - **MCP request timeout should be ≥90s.** Some queries (deep BFS, wide scene snapshots) can
   run close to a minute.
 
@@ -86,7 +125,7 @@ See `smoke.py` (if present) or exercise manually:
 # basic ping
 curl -s http://localhost:8765/mcp/ -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-# expect 15
+# expect 19
 ```
 
 Agent-side: ask "who is aphex twin and what are their top labels" — should invoke

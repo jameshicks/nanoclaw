@@ -1,4 +1,4 @@
-"""Discogs DuckDB MCP server. Exposes 16 tools over FastMCP HTTP on port 8765.
+"""Discogs DuckDB MCP server. Exposes 19 tools over FastMCP HTTP on port 8765.
 
 Expects a read-only DuckDB file at /data/discogs.duckdb (override with DISCOGS_DB_PATH)
 with FTS indexes already built via setup_fts.py. Fails fast at import if either is missing.
@@ -153,12 +153,30 @@ except Exception as e:
     print(f"FATAL: FTS indexes missing. Run setup_fts.py first. ({e})", file=sys.stderr)
     sys.exit(1)
 
-_CONN.execute("SET memory_limit='8GB'")
-_CONN.execute("SET threads=4")
+# Host is 12-core / 31GB and the container is uncapped, so the old 8GB/4-thread
+# ceiling left most of the box idle while single scans ran cold. Env-overridable
+# for tuning without a rebuild.
+_MEM_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "16GB")
+_THREADS = os.environ.get("DUCKDB_THREADS", "8")
+_CONN.execute(f"SET memory_limit='{_MEM_LIMIT}'")
+_CONN.execute(f"SET threads={int(_THREADS)}")
 # /data is mounted read-only, so DuckDB's default spill dir ({dbfile}.tmp)
 # fails when complex queries need to spill. Redirect to /tmp, which is
 # writable inside the container.
 _CONN.execute("SET temp_directory='/tmp/duckdb'")
+
+# Point the graph self-joins at the narrow release_artist_slim projection when
+# it's been built (build_edge_table.py); otherwise fall back to release_artist.
+_edge_table = Q.configure_edge_table(_CONN)
+if _edge_table == "release_artist_slim":
+    print("[edge-table] using release_artist_slim for graph traversals", flush=True)
+else:
+    print(
+        "[edge-table] release_artist_slim not found; graph traversals will be "
+        "slow. Run build_edge_table.py to speed up find_collaborators / "
+        "find_path_between_artists.",
+        flush=True,
+    )
 
 _CONN = _ConnProxy(_CONN)
 
@@ -176,11 +194,17 @@ mcp = FastMCP("nanoclaw-discogs")
 
 @mcp.tool
 @_log_call
-def search_artist(name: str, limit: int = 10) -> list[dict]:
+def search_artist(name: str, limit: int = 10, exact: bool = False) -> list[dict]:
     """Fuzzy search for artists by name (FTS / BM25). Returns id, name, realname,
     years_active (min-max of released_year across their credits), and top_labels
-    (top 3 labels by count of their primary-credited releases)."""
-    return Q.search_artist(_CONN, name, limit)
+    (top 3 labels by count of their primary-credited releases).
+
+    `exact=True` — when you already know the precise artist name and just need to
+    resolve it to an id, skip fuzzy ranking and enrichment: matches the name
+    directly (case-insensitive, tolerant of "&"/"and" and "(2)" disambiguators)
+    and returns only id/name/realname. Prefer this over a raw run_readonly_sql
+    lookup for exact name-to-id resolution."""
+    return Q.search_artist(_CONN, name, limit, exact)
 
 
 @mcp.tool
@@ -198,10 +222,15 @@ def search_release(
 
 @mcp.tool
 @_log_call
-def search_label(name: str, limit: int = 10) -> list[dict]:
+def search_label(name: str, limit: int = 10, exact: bool = False) -> list[dict]:
     """Fuzzy search for labels by name (FTS / BM25). Includes parent name and
-    sublabel/release counts."""
-    return Q.search_label(_CONN, name, limit)
+    sublabel/release counts.
+
+    `exact=True` — when you already know the precise label name and just need to
+    resolve it to an id, skip fuzzy ranking: matches the name directly
+    (case-insensitive + normalized) and returns id/name/parent_name plus
+    release_count. Prefer this over a raw run_readonly_sql lookup."""
+    return Q.search_label(_CONN, name, limit, exact)
 
 
 @mcp.tool
@@ -280,6 +309,82 @@ def get_artist_discography(
         bool(as_main_only),
         _year_range(year_range),
         bool(unique_masters_only),
+    )
+
+
+@mcp.tool
+@_log_call
+def get_person_credits(
+    person_id: int,
+    year_range: Optional[list[int]] = None,
+    unique_masters_only: bool = True,
+) -> list[dict]:
+    """Full credit history for a person (artist.id) across every role they're
+    credited in — performer, producer, engineer, writer, designer, etc. Use this
+    when looking up engineers, designers, mastering people, photographers, or
+    anyone whose Discogs page is sparsely populated under their "artist" entry
+    but who appears across many releases as a contributor. Each row carries
+    `role` (joined distinct roles for that release), `as_primary` (false for the
+    contributor case this tool is built for), and the usual release fields.
+    `year_range=[lo, hi]` filters released_year (NULLs excluded).
+    `unique_masters_only=True` (default) collapses pressings to one row per
+    master. Capped at 500 rows. For a band's catalog, prefer
+    `get_artist_discography` with `as_main_only=True` instead."""
+    return Q.get_artist_discography(
+        _CONN,
+        int(person_id),
+        None,
+        False,
+        _year_range(year_range),
+        bool(unique_masters_only),
+    )
+
+
+@mcp.tool
+@_log_call
+def get_release_by_catalog_number(
+    cat_no: str,
+    label_id: Optional[int] = None,
+) -> list[dict]:
+    """Direct lookup by Discogs catalog number (e.g. "SSQ225", "S-005",
+    "DGC-24515"). Catalog numbers are scoped to a label but not globally
+    unique — pass `label_id` to disambiguate when you know it, otherwise all
+    matches across labels are returned. Match is case- and whitespace-
+    insensitive but otherwise exact (does not strip hyphens — "S-005" and
+    "S005" are different cat numbers on Discogs). Each row: id, title, year,
+    country, master_id, label_id, label_name, catno, primary_artists. Capped
+    at 100 rows."""
+    return Q.get_release_by_catalog_number(
+        _CONN,
+        str(cat_no),
+        int(label_id) if label_id is not None else None,
+    )
+
+
+@mcp.tool
+@_log_call
+def get_label_credits_summary(
+    label_id: int,
+    year_range: Optional[list[int]] = None,
+    top_n_per_role: int = 10,
+) -> dict:
+    """Top credited people across a label's catalog, bucketed by role:
+    `performer` (primary credits — empty role), `producer`, `engineer`
+    (engineer/mix/master), `writer` (writer/composer/lyricist), `design`
+    (design/artwork/photography/sleeve/illustration), `other` (everything
+    else). Useful for spotting the recurring producers, engineers, designers,
+    etc. behind a label without pulling individual releases one by one. Each
+    bucket entry: artist_id, name, release_count, roles (distinct role
+    strings encountered). Returns `{label_id, label_name, release_count,
+    buckets}` where `buckets` is a dict keyed by bucket name. `year_range`
+    filters released_year (NULLs excluded). `top_n_per_role` clamped to
+    [1, 50]. Major labels with thousands of releases will be slow — use
+    `year_range` to scope down."""
+    return Q.get_label_credits_summary(
+        _CONN,
+        int(label_id),
+        _year_range(year_range),
+        int(top_n_per_role),
     )
 
 
@@ -447,12 +552,19 @@ Unofficial marker and are bootlegs.
 ## Tool routing
 
 - "who is X? what did they release?" → `search_artist` → `get_artist_discography`
+- "what did this engineer/designer/producer work on?" → `search_artist` → `get_person_credits`.
+  Same underlying data as `get_artist_discography` but with defaults tuned for
+  contributor credits (no role filter, includes non-primary appearances).
 - "tell me about this record" → `search_release` → `get_release`
+- "I have a catalog number" → `get_release_by_catalog_number`
 - "who played on / who produced / credits for a release" → `get_release_credits`
 - "what does this label put out?" → `search_label` → `get_label_releases` (titles) or
   `get_label_roster` (artists + counts). Add `include_credits=True` to
   `get_label_releases` for a role→names summary per release; fan out to
   `get_release_credits` for the handful that warrant full detail.
+- "who are the recurring producers/engineers/designers behind this label?" →
+  `get_label_credits_summary` (top-N people per role bucket across the catalog,
+  one query instead of pulling many releases).
 - "who has X worked with?" → `find_collaborators`
 - "are X and Y connected via collaborators?" → `find_path_between_artists`
 - "snapshot of a scene" (by label, year, country) → `get_scene_snapshot`
