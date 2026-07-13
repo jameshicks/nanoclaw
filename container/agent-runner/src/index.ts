@@ -223,6 +223,107 @@ function appendToolCallLog(entry: Record<string, unknown>): void {
   }
 }
 
+// Per-run token usage log. One line per completed run (main-thread result),
+// so rolling-window rate-limit load and per-task cost can be audited without
+// parsing full transcripts. Written to the mounted group logs dir.
+const USAGE_LOG_PATH = '/workspace/group/logs/usage.jsonl';
+
+function appendUsageLog(entry: Record<string, unknown>): void {
+  try {
+    fs.mkdirSync(path.dirname(USAGE_LOG_PATH), { recursive: true });
+    fs.appendFileSync(USAGE_LOG_PATH, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    log(
+      `Failed to write usage log: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// The four billable token counters. The SDK's main-thread result reports only
+// the main loop's usage — subagent (Task) tokens land in separate subagent
+// result messages. We sum them so the logged total reflects real consumption
+// (which for research runs is dominated by subagents: e.g. a main thread at
+// ~100k cache-read tokens whose subagent read 24M).
+const TOKEN_FIELDS = [
+  'input_tokens',
+  'cache_creation_input_tokens',
+  'cache_read_input_tokens',
+  'output_tokens',
+] as const;
+
+type TokenTotals = Record<(typeof TOKEN_FIELDS)[number], number>;
+
+function emptyTokenTotals(): TokenTotals {
+  return {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+  };
+}
+
+function addUsageInto(
+  acc: TokenTotals,
+  usage: Record<string, unknown> | undefined,
+): void {
+  if (!usage) return;
+  for (const f of TOKEN_FIELDS) {
+    const v = usage[f];
+    if (typeof v === 'number') acc[f] += v;
+  }
+}
+
+// Sum per-turn token usage across a session's subagent (Task) transcripts.
+//
+// The SDK does NOT deliver subagent usage to the parent query() stream — subagent
+// result messages never surface here, and subagent assistant messages arrive as
+// streaming partials with unreliable counts. But the SDK reliably persists each
+// subagent's full transcript (one assistant record per turn, complete usage) to
+// ~/.claude/projects/<escaped-cwd>/<sessionId>/subagents/*.jsonl. Reading those
+// after the run is the only trustworthy source. Verified against ground truth:
+// a run whose main thread billed ~60k cache-read tokens had a subagent that
+// billed 4.0M — all of it invisible to the stream.
+function sumSubagentTranscriptUsage(sessionId: string | null | undefined): {
+  usage: TokenTotals;
+  count: number;
+} {
+  const usage = emptyTokenTotals();
+  let count = 0;
+  if (!sessionId) return { usage, count };
+  const base = `${process.env.HOME || '/home/node'}/.claude/projects`;
+  try {
+    if (!fs.existsSync(base)) return { usage, count };
+    // The project dir is the escaped cwd; wildcard it rather than assume the name.
+    for (const proj of fs.readdirSync(base)) {
+      const subDir = path.join(base, proj, sessionId, 'subagents');
+      if (!fs.existsSync(subDir)) continue;
+      for (const file of fs.readdirSync(subDir)) {
+        if (!file.endsWith('.jsonl')) continue;
+        count++;
+        const lines = fs
+          .readFileSync(path.join(subDir, file), 'utf-8')
+          .split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const rec = JSON.parse(line) as {
+              message?: { usage?: Record<string, unknown> };
+            };
+            addUsageInto(usage, rec.message?.usage);
+          } catch {
+            // skip malformed line
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log(
+      `Failed to read subagent transcripts: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return { usage, count };
+}
+
 function createPreToolUseLogger(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const pre = input as PreToolUseHookInput;
@@ -625,7 +726,44 @@ async function runQuery(
       log(
         `Result #${resultCount}: subtype=${message.subtype}${isSubagentResult ? ` subagent_parent=${parentToolUseId}` : ''}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      // Subagent results must not be relayed to the user as the run's output;
+      // their token usage is recovered from transcripts below, not the stream.
       if (isSubagentResult) continue;
+      // Log per-run token usage for rate-limit / cost auditing. The SDK's
+      // main-thread result carries the main loop's usage plus cumulative cost
+      // (which already includes subagents). `usage` is main-thread only, so we
+      // add `subagent_usage` (summed from subagent transcripts) and emit
+      // `total_usage` = main + subagents for accurate token totals.
+      const rm = message as unknown as {
+        subtype?: string;
+        num_turns?: number;
+        duration_ms?: number;
+        total_cost_usd?: number;
+        usage?: Record<string, unknown>;
+      };
+      const { usage: subagentUsage, count: subagentCount } =
+        sumSubagentTranscriptUsage(newSessionId);
+      const totalUsage = emptyTokenTotals();
+      addUsageInto(totalUsage, rm.usage);
+      for (const f of TOKEN_FIELDS) totalUsage[f] += subagentUsage[f];
+      appendUsageLog({
+        ts: new Date().toISOString(),
+        session_id: newSessionId,
+        scheduled: containerInput.isScheduledTask === true,
+        label: prompt
+          .replace(/^\[SCHEDULED TASK[^\]]*\]\s*/, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 100),
+        subtype: rm.subtype,
+        num_turns: rm.num_turns,
+        duration_ms: rm.duration_ms,
+        total_cost_usd: rm.total_cost_usd,
+        usage: rm.usage,
+        subagent_count: subagentCount,
+        subagent_usage: subagentUsage,
+        total_usage: totalUsage,
+      });
       writeOutput({
         status: 'success',
         result: textResult || null,
