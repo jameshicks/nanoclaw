@@ -39,17 +39,21 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
-server.tool(
+server.registerTool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
   {
-    text: z.string().describe('The message text to send'),
-    sender: z
-      .string()
-      .optional()
-      .describe(
-        'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
-      ),
+    description:
+      "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+    inputSchema: {
+      text: z.string().describe('The message text to send'),
+      sender: z
+        .string()
+        .optional()
+        .describe(
+          'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
+        ),
+    },
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
@@ -142,13 +146,15 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         };
       }
     } else if (args.schedule_type === 'interval') {
-      const ms = parseInt(args.schedule_value, 10);
-      if (isNaN(ms) || ms <= 0) {
+      // Strict integer parse: parseInt('30m') silently returns 30, treating
+      // "30m" as 30 ms. Number('30m') returns NaN, which Number.isInteger rejects.
+      const ms = Number(args.schedule_value);
+      if (!Number.isInteger(ms) || ms <= 0) {
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Invalid interval: "${args.schedule_value}". Must be positive milliseconds (e.g., "300000" for 5 min).`,
+              text: `Invalid interval: "${args.schedule_value}". Must be a positive integer of milliseconds (e.g., "300000" for 5 min, "1800000" for 30 min). Duration suffixes like "30m" are not accepted.`,
             },
           ],
           isError: true,
@@ -401,13 +407,14 @@ server.tool(
       }
     }
     if (args.schedule_type === 'interval' && args.schedule_value) {
-      const ms = parseInt(args.schedule_value, 10);
-      if (isNaN(ms) || ms <= 0) {
+      // Strict integer parse — see schedule_task above.
+      const ms = Number(args.schedule_value);
+      if (!Number.isInteger(ms) || ms <= 0) {
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Invalid interval: "${args.schedule_value}".`,
+              text: `Invalid interval: "${args.schedule_value}". Must be a positive integer of milliseconds (e.g., "300000" for 5 min). Duration suffixes like "30m" are not accepted.`,
             },
           ],
           isError: true,

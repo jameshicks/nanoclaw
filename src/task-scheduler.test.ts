@@ -96,6 +96,31 @@ describe('task scheduler', () => {
     expect(computeNextRun(task)).toBeNull();
   });
 
+  it('computeNextRun rejects suffix-style interval values like "30m"', () => {
+    // Regression: parseInt('30m', 10) returns 30, which silently treated the
+    // task as a 30-millisecond interval instead of rejecting it.
+    const task = {
+      id: 'bad-interval',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'interval' as const,
+      schedule_value: '30m',
+      context_mode: 'isolated' as const,
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      last_run: null,
+      last_result: null,
+      status: 'active' as const,
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+
+    const nextRun = computeNextRun(task);
+    // Falls back to 1 minute from now, not 30ms
+    expect(nextRun).not.toBeNull();
+    const gap = new Date(nextRun!).getTime() - Date.now();
+    expect(gap).toBeGreaterThan(30_000);
+  });
+
   it('computeNextRun skips missed intervals without infinite loop', () => {
     // Task was due 10 intervals ago (missed)
     const ms = 60000;

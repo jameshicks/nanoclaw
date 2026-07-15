@@ -14,6 +14,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   ONECLI_URL,
+  SESSION_MAX_BYTES,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -33,6 +34,75 @@ const onecli = new OneCLI({ url: ONECLI_URL });
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/**
+ * Location of a group's SDK session transcripts on the host. The container
+ * mounts <sessions>/<folder>/.claude → /home/node/.claude and runs in
+ * /workspace/group, so transcripts land under projects/-workspace-group/.
+ */
+function groupSessionProjectsDir(groupFolder: string): string {
+  return path.join(
+    DATA_DIR,
+    'sessions',
+    groupFolder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+  );
+}
+
+/**
+ * Rotate a group's resumed session when its transcript exceeds SESSION_MAX_BYTES.
+ * Archives every transcript in the projects dir into a timestamped subfolder so
+ * the next turn starts fresh instead of re-hydrating (and repeatedly
+ * auto-compacting) a huge history. Returns true if a rotation happened, in which
+ * case the caller must clear the group's session pointer.
+ */
+export function rotateGroupSessionIfLarge(
+  groupFolder: string,
+  sessionId: string | undefined,
+): boolean {
+  if (!sessionId) return false;
+  const projectsDir = groupSessionProjectsDir(groupFolder);
+  const currentFile = path.join(projectsDir, `${sessionId}.jsonl`);
+  let size: number;
+  try {
+    size = fs.statSync(currentFile).size;
+  } catch {
+    return false; // no transcript yet — nothing to rotate
+  }
+  if (size <= SESSION_MAX_BYTES) return false;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const archiveDir = path.join(projectsDir, `_archived_${stamp}`);
+  try {
+    fs.mkdirSync(archiveDir, { recursive: true });
+    for (const entry of fs.readdirSync(projectsDir)) {
+      if (entry.endsWith('.jsonl')) {
+        fs.renameSync(
+          path.join(projectsDir, entry),
+          path.join(archiveDir, entry),
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      { groupFolder, sessionId, err },
+      'Failed to archive oversized group session — leaving it in place',
+    );
+    return false;
+  }
+  logger.info(
+    {
+      groupFolder,
+      sessionId,
+      sizeMB: (size / 1048576).toFixed(1),
+      archiveDir,
+    },
+    'Rotated oversized group session — next turn starts fresh',
+  );
+  return true;
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -269,6 +339,17 @@ async function buildContainerArgs(
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
+
+  // Bypass the OneCLI HTTP proxy when the target host is the docker host itself —
+  // this lets agents reach sidecar services (e.g. MCP servers on host.docker.internal:PORT)
+  // without the proxy hijacking the connection. Anthropic API calls still go through
+  // the proxy since their target host is api.anthropic.com, not host.docker.internal.
+  args.push(
+    '-e',
+    'NO_PROXY=host.docker.internal',
+    '-e',
+    'no_proxy=host.docker.internal',
+  );
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

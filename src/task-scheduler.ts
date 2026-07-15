@@ -41,8 +41,10 @@ export function computeNextRun(task: ScheduledTask): string | null {
   }
 
   if (task.schedule_type === 'interval') {
-    const ms = parseInt(task.schedule_value, 10);
-    if (!ms || ms <= 0) {
+    // Strict: schedule_value must be a positive integer string (milliseconds).
+    // parseInt('30m', 10) would silently return 30 — interpreting "30m" as 30 ms.
+    const ms = Number(task.schedule_value);
+    if (!Number.isInteger(ms) || ms <= 0) {
       // Guard against malformed interval that would cause an infinite loop
       logger.warn(
         { taskId: task.id, value: task.schedule_value },

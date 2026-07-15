@@ -48,6 +48,14 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
+// Rotate a group's resumed session once its transcript grows past this size.
+// Every group-context turn re-hydrates the full transcript and keeps triggering
+// auto-compaction, so an unbounded session becomes the dominant token cost.
+// Archiving it and starting fresh caps that. Default 15MB.
+export const SESSION_MAX_BYTES = parseInt(
+  process.env.SESSION_MAX_BYTES || '15728640',
+  10,
+); // 15MB default
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
