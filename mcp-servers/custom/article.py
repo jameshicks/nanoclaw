@@ -434,7 +434,29 @@ def _protected_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _link_bare(text: str, name: str, target: str) -> tuple[str, int]:
+_ADJACENT_CAP = re.compile(r"[A-Z][\w'’-]*")
+
+
+def _in_longer_name(text: str, start: int, end: int) -> bool:
+    """Is this match one word of a longer proper name?
+
+    A single-word page name is often the prefix or suffix of another entity:
+    Lard vs Lard Free, Voltaire vs Cabaret Voltaire, Palm vs Palm Desert.
+    Linking the fragment points the reader at the wrong act. A capitalised
+    word directly either side is the signal.
+    """
+    before = text[:start].rstrip(" ")
+    if before is not text[:start] and _ADJACENT_CAP.fullmatch(before.split(" ")[-1] if before.split(" ") else ""):
+        return True
+    after = text[end:]
+    if after.startswith(" "):
+        nxt = after[1:].split(" ")[0].split("\n")[0]
+        if nxt and _ADJACENT_CAP.fullmatch(nxt.rstrip(".,;:)")):
+            return True
+    return False
+
+
+def _link_bare(text: str, name: str, target: str, guard_compound: bool = False) -> tuple[str, int]:
     """Case-sensitive whole-word replace, skipping protected regions."""
     spans = _protected_spans(text)
     pat = re.compile(r"(?<![\w'’\-/|])" + re.escape(name) + r"(?![\w'’\-|])")
@@ -442,6 +464,8 @@ def _link_bare(text: str, name: str, target: str) -> tuple[str, int]:
     last = n = 0
     for m in pat.finditer(text):
         if any(a <= m.start() < b for a, b in spans):
+            continue
+        if guard_compound and _in_longer_name(text, m.start(), m.end()):
             continue
         out.append(text[last : m.start()])
         out.append(target)
