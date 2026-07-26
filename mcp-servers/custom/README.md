@@ -134,9 +134,16 @@ Stub creation is gated the same way the brief gates it: labels need more than
 one release, people and bands need more than one credit *and* a footprint
 beyond the entity being written about. Dead links beat low-value stubs.
 
-Back-link repair only touches **multi-word** names. The vault has pages called
-Low, Suicide, Swans and Wire; a bare-word replace across 17,650 files would
-rewrite ordinary prose into links with no undo.
+Back-link repair links bare mentions of the entity across the vault. Multi-word
+names are unambiguous and linked on sight. Single-word ones — the vault has
+pages called Low, Suicide, Swans and Wire — are linked only on pages that
+corroborate the subject: the page already links the entity, or at least two of
+its associated names (bandmates, labels, collaborators) appear in the text. A
+page about low temperatures will not mention two of a band's collaborators.
+
+Matching is case-sensitive and whole-word, and never writes into YAML
+frontmatter, fenced or inline code, existing wiki-links, or markdown link
+targets.
 
 `discogs_dry: true` in the fact sheet means Discogs has nothing — `build_article`
 flags the page's frontmatter, leaves the stub marker, and stops.

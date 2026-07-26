@@ -261,24 +261,90 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
 
 # ─── back-link repair ────────────────────────────────────────────────────
 
-# Single-word names are why this is guarded. The vault has pages called Low,
-# Suicide, Swans and Wire; a bare-word search-and-replace across 17,650 files
-# would rewrite ordinary prose into links and there is no undo.
-_SAFE_NAME = re.compile(r"^[\w'’.&-]+(?: [\w'’.&-]+)+$", re.UNICODE)
+_MULTIWORD = re.compile(r"^[\w'’.&-]+(?: [\w'’.&-]+)+$", re.UNICODE)
+
+# How many associated names must appear before a single-word name is treated
+# as the band rather than the English word.
+_CORROBORATION = 2
 
 
-def repair_backlinks(vault: str, folder: str, name: str, skip: str) -> dict:
-    """Link bare mentions of `name` across the vault. Multi-word names only."""
-    if not _SAFE_NAME.match(name):
-        return {"repaired": 0, "skipped_reason": "single-word name — too risky to auto-link"}
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    """Regions a link must never be inserted into: YAML frontmatter, fenced and
+    inline code, existing wiki-links, and markdown link targets."""
+    spans: list[tuple[int, int]] = []
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            spans.append((0, end + 4))
+    for pat in (
+        r"(?ms)^```.*?^```",
+        r"`[^`\n]+`",
+        r"\[\[[^\]]*\]\]",
+        r"\]\([^)]*\)",
+    ):
+        spans += [m.span() for m in re.finditer(pat, text)]
+    return spans
 
+
+def _link_bare(text: str, name: str, target: str) -> tuple[str, int]:
+    """Case-sensitive whole-word replace, skipping protected regions."""
+    spans = _protected_spans(text)
+    pat = re.compile(r"(?<![\w'’\-/|])" + re.escape(name) + r"(?![\w'’\-|])")
+    out: list[str] = []
+    last = n = 0
+    for m in pat.finditer(text):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        out.append(text[last : m.start()])
+        out.append(target)
+        last = m.end()
+        n += 1
+    out.append(text[last:])
+    return "".join(out), n
+
+
+def _corroborated(text: str, target: str, associates: list[str]) -> bool:
+    """Is this page actually talking about the entity?
+
+    Either it already links to it — so the subject is established — or enough
+    of its associated names (bandmates, labels, collaborators) appear that the
+    context is unambiguous. A page about low temperatures will not mention two
+    of a band's collaborators.
+    """
+    if target in text:
+        return True
+    return sum(1 for a in associates if a and a in text) >= _CORROBORATION
+
+
+def repair_backlinks(
+    vault: str,
+    folder: str,
+    name: str,
+    skip: str,
+    associates: Optional[list[str]] = None,
+) -> dict:
+    """Link bare mentions of `name` across the vault.
+
+    Multi-word names are unambiguous enough to link on sight. Single-word ones
+    are not — the vault has pages called Low, Suicide, Swans and Wire, and a
+    bare-word replace across 17,650 files would turn ordinary prose into links
+    with no undo. Those are linked only on pages that corroborate the subject,
+    which keeps them working instead of skipping them wholesale.
+    """
     target = f"[[{folder}/{name}]]"
-    # Not already inside a wiki-link, and not part of a longer word.
-    pat = re.compile(r"(?<!\[\[)(?<![\w|/])" + re.escape(name) + r"(?![\w|\]])")
-    changed = 0
-    for root, dirs, files in os.walk(vault):
+    associates = [a for a in (associates or []) if a and a != name]
+    needs_context = not _MULTIWORD.match(name)
+    if needs_context and not associates:
+        return {
+            "repaired": 0,
+            "files": 0,
+            "skipped_reason": "single-word name with no associated names to corroborate against",
+        }
+
+    changed = files = skipped_uncorroborated = 0
+    for root, dirs, fnames in os.walk(vault):
         dirs[:] = [d for d in dirs if not d.startswith((".", "_"))]
-        for fn in files:
+        for fn in fnames:
             if not fn.endswith(".md") or fn.startswith("_"):
                 continue
             path = os.path.join(root, fn)
@@ -288,13 +354,24 @@ def repair_backlinks(vault: str, folder: str, name: str, skip: str) -> dict:
                 text = open(path, encoding="utf-8").read()
             except OSError:
                 continue
-            new, n = pat.subn(target, text)
+            if name not in text:
+                continue
+            if needs_context and not _corroborated(text, target, associates):
+                skipped_uncorroborated += 1
+                continue
+            new, n = _link_bare(text, name, target)
             if n:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(new)
                 stubgen._match_dir_owner(path)
                 changed += n
-    return {"repaired": changed}
+                files += 1
+
+    out = {"repaired": changed, "files": files}
+    if needs_context:
+        out["mode"] = "corroborated (single-word name)"
+        out["skipped_uncorroborated"] = skipped_uncorroborated
+    return out
 
 
 # ─── stub gating ─────────────────────────────────────────────────────────
@@ -405,6 +482,16 @@ def build(
         result["stubs"]["gated_out"] = len(missing) - len(worthy)
 
     if backlinks and not dry_run:
-        result["backlinks"] = repair_backlinks(vault, folder, name, skip=path)
+        associates = (
+            list(fx.get("members") or [])
+            + list(fx.get("member_of") or [])
+            + list(fx.get("roster") or [])
+            + [c["name"] for c in fx.get("collaborators") or []]
+            + [l["name"] for l in fx.get("labels") or []]
+            + ([fx["parent"]] if fx.get("parent") else [])
+        )
+        result["backlinks"] = repair_backlinks(
+            vault, folder, name, skip=path, associates=associates
+        )
 
     return result
