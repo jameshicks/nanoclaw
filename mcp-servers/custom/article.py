@@ -305,9 +305,6 @@ def _release_table(rows: list[dict], kind: str) -> list[str]:
 def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str], index: dict) -> str:
     L = ["---", "sources: discogs", "---", "", f"# {fx['name']}", ""]
 
-    if overview:
-        L += ["## Overview", "", overview.strip(), ""]
-
     meta = [f"**Discogs ID:** {fx['id']}"]
     if fx.get("realname"):
         meta.append(f"**Real name:** {fx['realname']}")
@@ -320,8 +317,25 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
     L += ["  \n".join(meta), ""]
 
     if fx.get("profile"):
-        via = f" (via {fx['profile_via']})" if fx.get("profile_via") else ""
-        L += [f"## Discogs Profile{via}", "", "> " + fx["profile"].replace("\n", "\n> "), ""]
+        kindword = "label" if fx["kind"] == "label" else "artist"
+        via = fx.get("profile_via")
+        cite = (
+            f"— Discogs {kindword} profile for {via['name']} (ID {via['id']}), "
+            f"the entity behind {fx['name']}"
+            if via
+            else f"— Discogs {kindword} profile, ID {fx['id']}"
+        )
+        L += [
+            "## From Discogs",
+            "",
+            "> " + fx["profile"].replace("\n", "\n> "),
+            ">",
+            "> " + cite,
+            "",
+        ]
+
+    if overview:
+        L += ["## Overview", "", overview.strip(), ""]
 
     label = "Catalogue" if fx["kind"] == "label" else "Releases"
     table = _release_table(rows, fx["kind"])
@@ -510,7 +524,7 @@ _BB_URL = re.compile(r"\[url=([^\]]+)\]|\[/url\]")
 _PROFILE_CAP = 1500
 
 
-def _profile_text(conn, entity_id: int, kind: str) -> tuple[str, Optional[int]]:
+def _profile_text(conn, entity_id: int, kind: str) -> tuple[str, Optional[dict]]:
     """This entity's profile, or its real-name entity's if it has none.
 
     Mapstation's own profile is empty; Stefan Schneider — the artist behind the
@@ -525,12 +539,12 @@ def _profile_text(conn, entity_id: int, kind: str) -> tuple[str, Optional[int]]:
 
     alt = conn.execute(
         """
-        SELECT a2.id, a2.profile
+        SELECT a2.id, a2.profile, a2.name
           FROM artist_alias aa
           JOIN artist a2 ON a2.id = aa.alias_artist_id
          WHERE aa.artist_id = ? AND a2.profile IS NOT NULL AND LENGTH(a2.profile) > 40
          UNION ALL
-        SELECT a2.id, a2.profile
+        SELECT a2.id, a2.profile, a2.name
           FROM artist_alias aa
           JOIN artist a2 ON a2.name = aa.alias_name
          WHERE aa.artist_id = ? AND a2.profile IS NOT NULL AND LENGTH(a2.profile) > 40
@@ -538,7 +552,7 @@ def _profile_text(conn, entity_id: int, kind: str) -> tuple[str, Optional[int]]:
         """,
         [entity_id, entity_id],
     ).fetchone()
-    return (alt[1], alt[0]) if alt else ("", None)
+    return (alt[1], {"id": alt[0], "name": alt[2]}) if alt else ("", None)
 
 
 def _resolve_refs(conn, text: str) -> tuple[str, list[dict]]:

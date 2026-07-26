@@ -48,13 +48,32 @@ flags the page's frontmatter, leaves the stub marker in place, and stops.
 
 From the fact sheet **alone**, write:
 
-- **overview** — 2 to 4 sentences. What they are, when active, which scene,
-  and what the shape of the catalogue says. Use `eras`, `styles`, `labels`,
-  `collaborators`, `members`. State only what the data supports.
+- **overview** — a short paraphrase, 2 to 4 sentences.
+
+  If the fact sheet carries a `profile`, that is Discogs' own prose. The page
+  block-quotes it verbatim under "From Discogs" with attribution, so your job
+  is to **paraphrase, not repeat**: compress its substance into a sentence or
+  two in your own words, then add what it doesn't say and the data does — the
+  shape of the catalogue (`eras`), label relationships, recurring
+  collaborators. When `profile_via` is set the prose describes the entity
+  behind the alias, so say whose biography it is.
+
+  Never quote the profile back and never copy its phrasing. Where profile and
+  counts disagree, prefer the profile for biography and the counts for
+  catalogue.
+
+  With no `profile`, write from `eras`, `styles`, `labels`, `collaborators`
+  and `members` alone. State only what the data supports; invent no biography.
 - **questions** — Research Queue entries. Each must be answerable from **one**
   authoritative page. Never ask anything Discogs can answer — discography,
-  roster, founding year, catalogue numbers, label structure. Zero questions is
-  a fine answer; one vague question is not.
+  roster, founding year, catalogue numbers, label structure.
+
+  **If you can see it in the fact sheet or the quoted profile, it is not a
+  question.** Both of these were produced by the scheduled job and both are
+  wrong: "identify which release the 'Mixed By' credit is on" (the release
+  table names it) and "confirm his specific role on each release" (a Discogs
+  credit lookup). Zero questions is the correct answer for a thinly
+  documented entity; one vague question is worse than none.
 
 Then:
 
