@@ -51,4 +51,8 @@ groups/global/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Python bytecode (mcp-servers/)
+__pycache__/
+*.py[cod]
+
 agents-sdk-docs
