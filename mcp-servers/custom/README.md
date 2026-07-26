@@ -27,6 +27,14 @@ the `custom` key — no `.mcp.json` edits needed.
 | `list_compilations_featuring_artist(artist_id)` | Filtered on `release_format.descriptions` |
 | `describe_schema()` | Prose overview agents can fetch on demand |
 | `run_readonly_sql(query, row_limit=1000)` | sqlglot-validated SELECT-only escape hatch |
+| `search_wikipedia(query, limit=10)` | Full-text search over the offline Wikipedia ZIM. Returns `{title, path, snippet}` hits. |
+| `get_wikipedia_article(title, max_chars=40000)` | Fetch one article as clean plain text (redirects resolved, chrome stripped). Miss → `{found:False, suggestions}`. |
+
+The two `*_wikipedia` tools read a local Kiwix ZIM (text-only English Wikipedia) via
+libzim — an offline snapshot, not the live web. They boot lazily: if the ZIM is
+absent they return a clear "not available" message instead of failing the server.
+See `wikipedia.py`. Discogs stays the source of truth for discographies/credits;
+Wikipedia is for surrounding context (history, biographies, scenes).
 
 ## One-time setup
 
@@ -50,6 +58,24 @@ absent.
 python3 mcp-servers/custom/build_edge_table.py --db-path ~/projects/discogs_db/discogs.duckdb
 # --force to rebuild
 ```
+
+## Offline Wikipedia (optional)
+
+`search_wikipedia` / `get_wikipedia_article` read a Kiwix ZIM. Download the
+text-only English dump into the `/data` mount so the container sees it:
+
+```bash
+mkdir -p ~/projects/discogs_db/wikipedia
+curl -L -C - --retry 10 --retry-all-errors \
+  -o ~/projects/discogs_db/wikipedia/wikipedia_en_all_nopic_2026-06.zim \
+  https://download.kiwix.org/zim/wikipedia/wikipedia_en_all_nopic_2026-06.zim   # ~49 GB
+```
+
+The default path is `/data/wikipedia/wikipedia_en_all_nopic_2026-06.zim`; override
+with `WIKIPEDIA_ZIM_PATH`. To refresh with a newer monthly dump, drop the new ZIM
+in place and point `WIKIPEDIA_ZIM_PATH` at it (or match the default filename), then
+restart the container. No FTS build step — the ZIM ships its own Xapian full-text
+index.
 
 ## Build and run
 

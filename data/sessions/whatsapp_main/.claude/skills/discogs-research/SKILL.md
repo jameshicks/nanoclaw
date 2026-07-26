@@ -7,12 +7,14 @@ description: Systematically research artists, labels, and releases on Discogs us
 
 Systematic workflow for mining the Discogs DuckDB via MCP tools and writing findings to the `bands-research/` Obsidian vault at `/workspace/group/bands-research/`.
 
-## Hard Rule: Discogs First, Web on Permission
+## Hard Rule: Discogs First, then Offline Wikipedia, then Web on Permission
 
-1. Use **only** Discogs MCP tools until fully exhausted
-2. Write findings to `bands-research/` as you go
-3. When done, summarize findings, name specific gaps, and **ask the user** whether to search the web
-4. Never call WebSearch/WebFetch/agent-browser for music research without explicit user approval in that turn
+1. Use the Discogs MCP tools as the source of truth for discographies, credits, catalog numbers, and the collaborator graph — exhaust them first.
+2. For **context Discogs can't give** — band history, genre/scene background, member biographies, label backstory, cultural context — use the **offline Wikipedia** tools (`search_wikipedia`, `get_wikipedia_article`). These are a **local June-2026 snapshot**, not the live internet: no network, no API cost, no permission needed. Use them freely, the same as any other MCP tool. They do **not** count as "web".
+3. Write findings to `bands-research/` as you go.
+4. Only the **live web** (WebSearch/WebFetch/agent-browser) is gated: when Discogs *and* offline Wikipedia are both exhausted, summarize findings, name specific gaps, and **ask the user** whether to search the live web. Never call those without explicit user approval in that turn.
+
+**Cite Wikipedia as Wikipedia.** When a fact comes from an article, attribute it (the tool returns a `url`) so vault pages distinguish Discogs-sourced structure from Wikipedia-sourced prose.
 
 ---
 
@@ -65,6 +67,23 @@ mcp__custom__find_collaborators(artist_id, min_shared_releases=2, limit=20)
 mcp__custom__find_path_between_artists(artist_id_1, artist_id_2)
 mcp__custom__get_scene_snapshot(label_ids?, artist_ids?, year_from?, year_to?)
 ```
+
+### Offline Wikipedia (local snapshot, June 2026)
+```
+mcp__custom__search_wikipedia(query, limit=10)
+    → {query, estimated_matches, results:[{title, path, snippet}]}
+      full-text ranked over article bodies
+mcp__custom__get_wikipedia_article(title, max_chars=40000)
+    → {found, title, url, chars, text}  (clean plain text; redirects resolved;
+      infobox facts kept, references/navboxes stripped)
+      on a miss: {found:False, suggestions:[...]}
+```
+
+Workflow: `search_wikipedia` to find the right article, then `get_wikipedia_article`
+with a result's `title`. If you already know the exact title, call
+`get_wikipedia_article` directly — on a miss it returns `suggestions`. Use for the
+prose *around* the discography (history, scenes, biographies), never as a
+substitute for Discogs credit/catalog data. Text-only dump — no images.
 
 ### Raw SQL
 ```
@@ -163,6 +182,47 @@ Brief context.
 - Open Questions
 
 ---
+
+## Trawl depth rules
+
+Keep payloads bounded — don't load an entity's entire footprint when a representative selection suffices:
+- **Labels with fewer than 1,000 releases**: pull the full catalog — no cap.
+- **Labels with 1,000+ releases** (major/large labels): focus on the most significant 30–40 — prioritise original LPs, landmark releases, and releases most relevant to the vault's scene focus.
+- **Artists, bands, and people with more than 50 credits**: focus on the most significant 30–40 (LPs over singles, originals over reissues, credited over uncredited). A representative selection is sufficient for prolific session players.
+- **For people (session players, engineers, producers)**: call `get_artist_discography` with `as_main_only=True` first to get primary credits; only fetch full contributor credits for the most relevant projects if the primary-credit picture is sparse. This avoids loading hundreds of guest appearances.
+- **If Discogs has no matching data** (search returns nothing, or only obviously wrong matches): add `discogs_dry: true` to the page's YAML frontmatter (with `sources: discogs_dry`), leave `## Stub — needs full research` in place, note it in the return summary, and stop.
+
+## When to create a stub file
+
+**Person** — only if they appear in credits across more than one band/project (not just the entity being researched) AND have more than one Discogs credit total. Do NOT stub one-off session players, guest vocalists, or anyone whose entire Discogs footprint is credits with only the band being researched.
+
+**Band/Artist** — only if they have a meaningful independent Discogs presence of their own, not just a cameo on one release by the entity being researched.
+
+**Label** — only if it has more than one release in Discogs. Do NOT stub one-release labels.
+
+**Dead links are preferred over low-value stubs.** Writing `[[Some Band]]` in prose without creating the file is fine — the link is still useful and the stub can be created later if the name recurs. Don't create stubs just to avoid dead links.
+
+## Research Queue — quality gate
+
+Every Research Queue entry must be a concrete question answerable by reading ONE authoritative web page (Wikipedia, AllMusic, an official site, a named interview, contemporary press). If it would need 3+ sources or synthesis, sharpen it or leave it out.
+
+**Do NOT add:**
+- "Confirm Discogs ID" — trivial
+- "Full discography / full catalog / full roster" — that's what Discogs trawls are for
+- "Founding year / years active / dates of operation" (labels or bands)
+- "Distribution arrangements / parent company / who distributes"
+- "Studio location", "rights/licensing", or pressing-plant questions (which plant, quantities, third-party pressing)
+- Anything directly answerable from Discogs in a future trawl
+- Vague open-ended prompts ("more about X's career", "explore the X/Y connection") — discarded in triage
+
+**Good question shapes:**
+- "Confirm whether [person] played on [specific release] or only on the [reissue]"
+- "What was [person]'s role after leaving [band] in [year] — did they join [specific band]?"
+- "Sleeve credits [release] as produced by X but Discogs says Y — which is correct?"
+- "Was [album] recorded at [studio] per [interview], or [alternate studio] per liner notes?"
+- "Identify [recurring uncredited person] on [releases A, B, C] with no Discogs profile"
+
+Ten specific questions beat five vague ones — no limit; the only gate is concrete + single-source-resolvable.
 
 ## Efficiency Tips
 

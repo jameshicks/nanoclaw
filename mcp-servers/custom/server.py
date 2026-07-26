@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 
 import queries as Q
 import sql_guard
+import wikipedia as W
 
 
 QUERY_LOG_PATH = os.environ.get("QUERY_LOG_PATH", "/logs/queries.jsonl")
@@ -628,6 +629,36 @@ def run_readonly_sql(query: str, row_limit: int = 1000) -> dict:
         if hint:
             result["hint"] = hint
     return result
+
+
+@mcp.tool
+@_log_call
+def search_wikipedia(query: str, limit: int = 10) -> dict:
+    """Full-text search over an OFFLINE English Wikipedia dump (text-only, no
+    images). Ranked by relevance against article bodies via the ZIM's embedded
+    index. Returns `{query, estimated_matches, results:[{title, path, snippet}]}`.
+    Pass a `title` from the results to `get_wikipedia_article` to read the full
+    text. `limit` clamped to [1, 50].
+
+    Use this for context Discogs can't give you — band histories, genre/scene
+    background, member biographies, label backstory, cultural context. Discogs
+    remains the source of truth for discographies, credits, and catalog numbers;
+    Wikipedia is for the prose around them. This is a local snapshot (June 2026),
+    not the live web."""
+    return W.search(query, limit)
+
+
+@mcp.tool
+@_log_call
+def get_wikipedia_article(title: str, max_chars: int = 40000) -> dict:
+    """Fetch a single OFFLINE Wikipedia article as clean plain text (chrome,
+    references, and navboxes stripped; infobox facts kept). Resolves redirects
+    automatically. On an exact-title miss, returns
+    `{found: False, suggestions:[...]}` so you can retry with a better title —
+    or call `search_wikipedia` first and pass a result's `title`/`path` here.
+    `max_chars` (default 40000) truncates very long articles; clamped to
+    [500, 200000]. Local June-2026 snapshot, not the live web."""
+    return W.get_article(title, max_chars)
 
 
 if __name__ == "__main__":
