@@ -188,6 +188,14 @@ def _collaborators(conn, artist_id: int, limit: int = 12) -> list[dict]:
 
 
 def _label_summary(conn, artist_id: int, limit: int = 12) -> list[dict]:
+    """Labels ranked by distinct works, not pressings.
+
+    No minimum: counting masters, a single work is a real release, and small
+    artists have nothing else. Requiring two — which made sense when this
+    counted pressings — hid every Fe-mail label but one, while the overview
+    the model wrote from the fact sheet named them all. Noise sorts to the
+    bottom and the LIMIT handles it.
+    """
     cur = conn.execute(
         """
         SELECT rl.label_name, COUNT(DISTINCT COALESCE(r.master_id, -r.id)) n,
@@ -197,7 +205,7 @@ def _label_summary(conn, artist_id: int, limit: int = 12) -> list[dict]:
           JOIN release_label rl ON rl.release_id = r.id
          WHERE ras.artist_id = ? AND rl.label_name IS NOT NULL
            AND rl.label_name NOT ILIKE 'Not On Label%' AND r.released_year > 0
-         GROUP BY 1 HAVING COUNT(DISTINCT COALESCE(r.master_id, -r.id)) >= 2
+         GROUP BY 1
          ORDER BY n DESC, rl.label_name LIMIT ?
         """,
         [artist_id, limit],
