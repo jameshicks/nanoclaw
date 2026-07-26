@@ -127,6 +127,20 @@ These two tools move that work next to the database:
    summary, roster, connections, and the Discogs header. It also creates stubs
    for newly linked entities and repairs back-links across the vault.
 
+The page also quotes the entity's Discogs **profile** — the free-text field
+where the material that looks like outside research actually lives. Force Inc's
+label code, founding month, founder and the EFA-Medien collapse are all in its
+profile; a trawler reading `get_label` was paraphrasing that field, not
+researching. When an alias has no profile of its own the real-name entity is
+followed one hop (Mapstation is empty; Stefan Schneider carries the Düsseldorf
+art-academy biography). BBCode entity references like `[a=Achim Szepanski]` and
+`[l199815]` are resolved to names, linked, and returned in `profile_refs` —
+they are real link targets, and most of why a trawler-written page carried
+several times the wiki-links this used to emit.
+
+Only ~7% of artists and ~9% of labels have a substantial profile, so this
+closes the gap on notable entities and changes nothing for the long tail.
+
 Depth rules match the trawler brief — primary credits only past 50, capped at
 40 releases, full catalogue for labels under 1,000 releases.
 

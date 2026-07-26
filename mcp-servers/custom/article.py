@@ -241,8 +241,13 @@ def facts(conn, folder: str, name: str) -> dict[str, Any]:
             "labels": _label_summary(conn, entity_id),
         }
 
+    prof_raw, via = _profile_text(conn, entity_id, out["kind"])
+    prof, prof_refs = _resolve_refs(conn, prof_raw) if prof_raw else ("", [])
     out.update(
         {
+            "profile": prof,
+            "profile_via": via,
+            "profile_refs": prof_refs,
             "resolved": True,
             "target": f"{folder}/{name}",
             "id": entity_id,
@@ -252,7 +257,7 @@ def facts(conn, folder: str, name: str) -> dict[str, Any]:
             "first_year": f.get("year_min"),
             "styles": f.get("styles"),
             "eras": _eras(rows),
-            "has_profile": bool(f.get("profile")),
+            "has_profile": bool(prof),
             "gaps": stubgen._gaps(f),
             "discogs_dry": not rows and not f.get("credit_count"),
         }
@@ -314,6 +319,10 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
         meta.append(f"**Top styles:** {'; '.join(fx['styles'])}")
     L += ["  \n".join(meta), ""]
 
+    if fx.get("profile"):
+        via = f" (via {fx['profile_via']})" if fx.get("profile_via") else ""
+        L += [f"## Discogs Profile{via}", "", "> " + fx["profile"].replace("\n", "\n> "), ""]
+
     label = "Catalogue" if fx["kind"] == "label" else "Releases"
     table = _release_table(rows, fx["kind"])
     if table:
@@ -357,6 +366,13 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
         conns.append(
             f"- {stubgen._link(conn, c['name'], 'person', index)} — {c['shared']} shared releases"
         )
+    listed_names = {c.split("/")[-1].rstrip("]") for c in conns}
+    for r in fx.get("profile_refs") or []:
+        if r["name"] not in listed_names and r["name"] != fx["name"]:
+            conns.append(
+                f"- {stubgen._link(conn, r['name'], r['kind'], index)} — named in Discogs profile"
+            )
+
     if conns:
         L += ["## Connections", "", *conns, ""]
 
@@ -480,6 +496,88 @@ def repair_backlinks(
         out["mode"] = "corroborated (single-word name)"
         out["skipped_uncorroborated"] = skipped_uncorroborated
     return out
+
+
+# ─── Discogs profile prose ───────────────────────────────────────────────
+
+# Discogs profiles are free text with BBCode-ish entity references. This is
+# where the material that looks like outside research actually lives — Force
+# Inc's label code, founding month and the EFA-Medien collapse are all in its
+# profile field, and a trawler reading `get_label` was simply paraphrasing it.
+_BB_ENTITY = re.compile(r"\[(a|l|m|r)(?:=)?([^\]]+)\]")
+_BB_FORMAT = re.compile(r"\[/?(b|i|u|s|q|center)\]")
+_BB_URL = re.compile(r"\[url=([^\]]+)\]|\[/url\]")
+_PROFILE_CAP = 1500
+
+
+def _profile_text(conn, entity_id: int, kind: str) -> tuple[str, Optional[int]]:
+    """This entity's profile, or its real-name entity's if it has none.
+
+    Mapstation's own profile is empty; Stefan Schneider — the artist behind the
+    alias — carries the Düsseldorf art-academy biography one hop away. The
+    trawler finds it by walking aliases, so we do the same.
+    """
+    table = "label" if kind == "label" else "artist"
+    row = conn.execute(f"SELECT profile FROM {table} WHERE id = ?", [entity_id]).fetchone()
+    text = (row[0] if row else "") or ""
+    if text.strip() or kind == "label":
+        return text, None
+
+    alt = conn.execute(
+        """
+        SELECT a2.id, a2.profile
+          FROM artist_alias aa
+          JOIN artist a2 ON a2.id = aa.alias_artist_id
+         WHERE aa.artist_id = ? AND a2.profile IS NOT NULL AND LENGTH(a2.profile) > 40
+         UNION ALL
+        SELECT a2.id, a2.profile
+          FROM artist_alias aa
+          JOIN artist a2 ON a2.name = aa.alias_name
+         WHERE aa.artist_id = ? AND a2.profile IS NOT NULL AND LENGTH(a2.profile) > 40
+         LIMIT 1
+        """,
+        [entity_id, entity_id],
+    ).fetchone()
+    return (alt[1], alt[0]) if alt else ("", None)
+
+
+def _resolve_refs(conn, text: str) -> tuple[str, list[dict]]:
+    """Strip BBCode and pull out the entities the profile names.
+
+    References come as `[a=Achim Szepanski]` or by id as `[l199815]`. They are
+    real link targets — resolving them is most of why a trawler-written page
+    carries several times the wiki-links this used to emit.
+    """
+    refs: list[dict] = []
+    by_id: dict[tuple[str, int], Optional[str]] = {}
+
+    for tag, body in _BB_ENTITY.findall(text):
+        if tag in ("a", "l") and body.isdigit():
+            by_id[(tag, int(body))] = None
+    for (tag, ident) in list(by_id):
+        table = "artist" if tag == "a" else "label"
+        row = conn.execute(f"SELECT name FROM {table} WHERE id = ?", [ident]).fetchone()
+        by_id[(tag, ident)] = row[0] if row else None
+
+    def sub(m: re.Match) -> str:
+        tag, body = m.group(1), m.group(2)
+        if tag in ("m", "r"):
+            return ""  # release/master pointers add noise, not names
+        name = by_id.get((tag, int(body))) if body.isdigit() else body
+        if not name:
+            return ""
+        kind = "label" if tag == "l" else "person"
+        if not any(r["name"] == name for r in refs):
+            refs.append({"name": name, "kind": kind})
+        return name
+
+    out = _BB_ENTITY.sub(sub, text)
+    out = _BB_FORMAT.sub("", out)
+    out = _BB_URL.sub("", out)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if len(out) > _PROFILE_CAP:
+        out = out[:_PROFILE_CAP].rsplit(" ", 1)[0] + " …"
+    return out, refs
 
 
 # ─── stub gating ─────────────────────────────────────────────────────────
