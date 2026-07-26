@@ -198,6 +198,8 @@ The task will run in that group's context with access to their files and memory.
 
 For any recurring task, use `schedule_task`. Frequent agent invocations — especially multiple times a day — consume API credits and can risk account restrictions. If a simple check can determine whether action is needed, add a `script` — it runs first, and the agent is only called when the check passes. This keeps invocations to a minimum.
 
+> **Before authoring any job that reads or edits a data file (a queue, log, index, backlog, or vault) on every run, load the `authoring-jobs` skill first** (`Skill("authoring-jobs")`). It covers the gate→batch→apply design that keeps per-run cost bounded, the whole-file-read anti-patterns to avoid, and the reusable `_queue_tools.mjs` helper. Skipping it is how recurring jobs turn into silent runaway token bills.
+
 ### How it works
 
 1. You provide a bash `script` alongside the `prompt` when scheduling
