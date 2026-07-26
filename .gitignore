@@ -55,4 +55,7 @@ groups/global/*
 __pycache__/
 *.py[cod]
 
+# Personal advocacy/meeting notes accompanying docs/architecture-tradeoffs.md
+tradeoffs-advocacy.md
+
 agents-sdk-docs
