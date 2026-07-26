@@ -42,8 +42,44 @@ def _first(d: dict, *names, default=None):
 # ─── fact gathering ──────────────────────────────────────────────────────
 
 
+def _pressing_counts(conn, master_ids: list[int]) -> dict[int, int]:
+    """How many pressings each master has.
+
+    This is the significance signal. A landmark album is pressed and repressed
+    for decades; a bootleg or a one-off live tape exists once. Nothing else in
+    the dump ranks releases, and sorting by year instead — as this did first —
+    truncates a career at whatever the cap allows, which dropped Synchronicity
+    from The Police.
+    """
+    ids = [m for m in master_ids if m]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    return dict(
+        conn.execute(
+            f"SELECT master_id, COUNT(*) FROM release WHERE master_id IN ({placeholders}) GROUP BY 1",
+            ids,
+        ).fetchall()
+    )
+
+
+def _rank_and_cap(conn, rows: list[dict]) -> list[dict]:
+    if len(rows) > SELECT_CAP:
+        pressings = _pressing_counts(conn, [r.get("master_id") for r in rows])
+        rows.sort(
+            key=lambda r: (
+                not _first(r, "as_primary", default=False),
+                -pressings.get(r.get("master_id"), 1),
+                _first(r, "year", default=9999) or 9999,
+            )
+        )
+        rows = rows[:SELECT_CAP]
+    rows.sort(key=lambda r: (_first(r, "year", default=9999) or 9999, r.get("title") or ""))
+    return rows
+
+
 def _artist_releases(conn, artist_id: int, credit_count: int) -> list[dict]:
-    """Significant releases, newest ordering left to the caller.
+    """Significant releases, listed chronologically.
 
     Past BIG_CATALOG credits we switch to primary credits only — the brief's
     rule for session players, whose guest appearances would otherwise swamp
@@ -51,12 +87,7 @@ def _artist_releases(conn, artist_id: int, credit_count: int) -> list[dict]:
     """
     as_main_only = credit_count > BIG_CATALOG
     rows = Q.get_artist_discography(conn, artist_id, None, as_main_only, None, True)
-    if len(rows) > SELECT_CAP:
-        # Prefer the artist's own releases, then earliest pressing.
-        rows.sort(key=lambda r: (not _first(r, "as_primary", default=False), _first(r, "year", default=9999) or 9999))
-        rows = rows[:SELECT_CAP]
-    rows.sort(key=lambda r: (_first(r, "year", default=9999) or 9999, r.get("title") or ""))
-    return rows
+    return _rank_and_cap(conn, rows)
 
 
 def _label_releases(conn, label_id: int, total: int) -> list[dict]:
@@ -76,21 +107,82 @@ def _eras(rows: list[dict]) -> list[dict]:
     return [{"decade": d, "releases": n} for d, n in sorted(tally.items())]
 
 
+# Roles the precomputed `is_non_musical` flag misses. Its blocklist catches
+# "Design" but not bare "Art Direction", and nothing about mastering — so
+# "Art Direction, Design" is flagged while "Art Direction" alone is not. On a
+# major-label catalogue that fills the top shared credits with art directors
+# and mastering engineers who touched every reissue. Producers and engineers
+# are deliberately NOT here: Nigel Gray and Hugh Padgham belong in Connections.
+_TECHNICAL_ROLES = (
+    "%Art Direction%",
+    "%Master%",
+    "%Lacquer%",
+    "%Compiled%",
+    "%Compilation%",
+)
+
+
+def _bandmate_ids(conn, artist_id: int) -> set[int]:
+    """Members of this act, plus their aliases.
+
+    Aliases matter: group_member records The Police's singer as Gordon Sumner
+    (207403) while his credits are under Sting (13961). Without expanding
+    aliases he lands in Members *and* tops Connections as a collaborator.
+    """
+    ids = {
+        r[0]
+        for r in conn.execute(
+            "SELECT member_artist_id FROM group_member WHERE group_artist_id = ?"
+            " AND member_artist_id IS NOT NULL",
+            [artist_id],
+        ).fetchall()
+    }
+    if not ids:
+        return ids
+    ph = ",".join("?" * len(ids))
+    aliased = conn.execute(
+        f"""
+        SELECT aa.alias_artist_id FROM artist_alias aa
+         WHERE aa.artist_id IN ({ph}) AND aa.alias_artist_id IS NOT NULL
+        UNION
+        SELECT aa.artist_id FROM artist_alias aa
+         WHERE aa.alias_artist_id IN ({ph})
+        UNION
+        SELECT a2.id FROM artist_alias aa
+          JOIN artist a1 ON a1.id = aa.artist_id
+          JOIN artist a2 ON a2.name = aa.alias_name
+         WHERE aa.artist_id IN ({ph})
+        """,
+        list(ids) * 3,
+    ).fetchall()
+    return ids | {r[0] for r in aliased if r[0]}
+
+
 def _collaborators(conn, artist_id: int, limit: int = 12) -> list[dict]:
-    """Most-shared co-credits. A direct join, not the BFS in find_collaborators —
-    depth-1 is all an article needs and the BFS is far more expensive."""
+    """Most-shared *musical* co-credits.
+
+    A direct join, not the BFS in find_collaborators — depth-1 is all an article
+    needs and the BFS is far more expensive. `is_non_musical` matters here: on
+    a major-label catalogue the top shared credits are otherwise the sleeve
+    photographers, designers, mastering engineers and label executives, who
+    appear on every pressing.
+    """
+    exclude = {artist_id} | set(stubgen.SPECIAL_ARTIST_IDS) | _bandmate_ids(conn, artist_id)
+    ph = ",".join("?" * len(exclude))
+    role_filter = " AND ".join(["ras.role NOT ILIKE ?"] * len(_TECHNICAL_ROLES))
     cur = conn.execute(
         f"""
         SELECT a.name, COUNT(DISTINCT ras.release_id) n
           FROM release_artist_slim me
           JOIN release_artist_slim ras ON ras.release_id = me.release_id
           JOIN artist a ON a.id = ras.artist_id
-         WHERE me.artist_id = ? AND ras.artist_id <> ?
-           AND ras.artist_id NOT IN ({','.join(map(str, stubgen.SPECIAL_ARTIST_IDS))})
+         WHERE me.artist_id = ? AND ras.is_non_musical = FALSE
+           AND ras.artist_id NOT IN ({ph})
+           AND (ras.role IS NULL OR ({role_filter}))
          GROUP BY 1 HAVING COUNT(DISTINCT ras.release_id) > 1
          ORDER BY n DESC, a.name LIMIT ?
         """,
-        [artist_id, artist_id, limit],
+        [artist_id, *exclude, *_TECHNICAL_ROLES, limit],
     )
     return [{"name": r[0], "shared": r[1]} for r in cur.fetchall()]
 
@@ -98,19 +190,19 @@ def _collaborators(conn, artist_id: int, limit: int = 12) -> list[dict]:
 def _label_summary(conn, artist_id: int, limit: int = 12) -> list[dict]:
     cur = conn.execute(
         """
-        SELECT rl.label_name, COUNT(DISTINCT r.id) n,
+        SELECT rl.label_name, COUNT(DISTINCT COALESCE(r.master_id, -r.id)) n,
                MIN(r.released_year) y0, MAX(r.released_year) y1
           FROM release_artist_slim ras
           JOIN release r ON r.id = ras.release_id
           JOIN release_label rl ON rl.release_id = r.id
          WHERE ras.artist_id = ? AND rl.label_name IS NOT NULL
            AND rl.label_name NOT ILIKE 'Not On Label%' AND r.released_year > 0
-         GROUP BY 1 HAVING COUNT(DISTINCT r.id) >= 2
+         GROUP BY 1 HAVING COUNT(DISTINCT COALESCE(r.master_id, -r.id)) >= 2
          ORDER BY n DESC, rl.label_name LIMIT ?
         """,
         [artist_id, limit],
     )
-    return [{"name": r[0], "releases": r[1], "years": f"{r[2]}–{r[3]}"} for r in cur.fetchall()]
+    return [{"name": r[0], "works": r[1], "years": f"{r[2]}–{r[3]}"} for r in cur.fetchall()]
 
 
 def facts(conn, folder: str, name: str) -> dict[str, Any]:
@@ -170,11 +262,17 @@ def _esc(s: Any) -> str:
 def _release_table(rows: list[dict], kind: str) -> list[str]:
     if not rows:
         return []
-    head = (
-        ["| Release | Year | Artists | Cat # |", "|---|---|---|---|"]
-        if kind == "label"
-        else ["| Release | Year | Label | Role |", "|---|---|---|---|"]
-    )
+    if kind == "label":
+        head = ["| Release | Year | Artists | Cat # |", "|---|---|---|---|"]
+    else:
+        # Only carry a Role column when some row actually has one — a band's
+        # own releases carry no role and the column is "—" all the way down.
+        show_role = any(_esc(r.get("role")) for r in rows)
+        head = (
+            ["| Release | Year | Label | Role |", "|---|---|---|---|"]
+            if show_role
+            else ["| Release | Year | Label |", "|---|---|---|"]
+        )
     body = []
     for r in rows:
         year = _first(r, "year", "released_year", default="—")
@@ -182,10 +280,12 @@ def _release_table(rows: list[dict], kind: str) -> list[str]:
             body.append(
                 f"| *{_esc(r.get('title'))}* | {year} | {_esc(_first(r,'primary_artists','artists'))} | {_esc(r.get('catno'))} |"
             )
-        else:
+        elif show_role:
             body.append(
                 f"| *{_esc(r.get('title'))}* | {year} | {_esc(r.get('labels'))} | {_esc(r.get('role')) or '—'} |"
             )
+        else:
+            body.append(f"| *{_esc(r.get('title'))}* | {year} | {_esc(r.get('labels'))} |")
     return head + body
 
 
@@ -210,8 +310,8 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
     table = _release_table(rows, fx["kind"])
     if table:
         note = (
-            f" — {fx['selected_releases']} of {fx['total_credits']:,} credits, "
-            "most significant first"
+            f" — {fx['selected_releases']} most-pressed of "
+            f"{fx['total_credits']:,} credits, chronological"
             if (fx.get("total_credits") or 0) > fx["selected_releases"]
             else ""
         )
@@ -223,8 +323,8 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
         ] + [""]
 
     if fx.get("labels"):
-        L += ["## Labels", "", "| Label | Releases | Years |", "|---|---|---|"] + [
-            f"| {stubgen._link(conn, l['name'], 'label', index)} | {l['releases']} | {l['years']} |"
+        L += ["## Labels", "", "| Label | Works | Years |", "|---|---|---|"] + [
+            f"| {stubgen._link(conn, l['name'], 'label', index)} | {l['works']} | {l['years']} |"
             for l in fx["labels"]
         ] + [""]
 
