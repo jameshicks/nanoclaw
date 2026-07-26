@@ -361,9 +361,12 @@ function extractErrorFromResponse(
   return { isError: false };
 }
 
-function createPostToolUseLogger(): HookCallback {
+function createPostToolUseLogger(
+  onToolUse?: (toolName: string) => void,
+): HookCallback {
   return async (input, _toolUseId, _context) => {
     const post = input as PostToolUseHookInput;
+    if (onToolUse) onToolUse(post.tool_name);
     const startedAt = post.tool_use_id
       ? toolCallStarts.get(post.tool_use_id)
       : undefined;
@@ -592,6 +595,10 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Track whether the agent delivered output via the send_message tool. For
+  // scheduled tasks, if it did, we suppress relaying the trailing final result
+  // so the channel doesn't get both a detailed message and a summary.
+  let sentMessageViaTool = false;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -676,7 +683,17 @@ async function runQuery(
           { hooks: [createPreCompactHook(containerInput.assistantName)] },
         ],
         PreToolUse: [{ hooks: [createPreToolUseLogger()] }],
-        PostToolUse: [{ hooks: [createPostToolUseLogger()] }],
+        PostToolUse: [
+          {
+            hooks: [
+              createPostToolUseLogger((toolName) => {
+                if (toolName === 'mcp__nanoclaw__send_message') {
+                  sentMessageViaTool = true;
+                }
+              }),
+            ],
+          },
+        ],
       },
     },
   })) {
@@ -764,9 +781,19 @@ async function runQuery(
         subagent_usage: subagentUsage,
         total_usage: totalUsage,
       });
+      // A scheduled task that already delivered its output via the
+      // send_message tool should not ALSO relay its trailing final text —
+      // that produced a duplicate "detailed message + summary" on the channel.
+      const suppressResult =
+        containerInput.isScheduledTask === true && sentMessageViaTool;
+      if (suppressResult && textResult) {
+        log(
+          `Suppressing final-result relay for scheduled task (already sent via send_message): ${textResult.slice(0, 120)}`,
+        );
+      }
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: suppressResult ? null : textResult || null,
         newSessionId,
       });
     }
