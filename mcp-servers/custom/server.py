@@ -17,6 +17,7 @@ from typing import Any, Optional
 import duckdb
 from fastmcp import FastMCP
 
+import article
 import queries as Q
 import sql_guard
 import stubgen
@@ -692,6 +693,63 @@ def write_stubs(targets: list[str], dry_run: bool = False) -> dict:
     Does NOT write scene/genre prose or a releases table — this is the factual
     skeleton only."""
     return stubgen.write_stubs(_CONN, VAULT_PATH, targets, dry_run)
+
+
+@mcp.tool
+@_log_call
+def article_facts(target: str) -> dict:
+    """Compact fact sheet for a vault page (`Folder/Name`), for writing a full
+    article from. Returns entity identity, total credits, first year, release
+    counts per decade, top styles, members, bands they belong to, top
+    collaborators with shared-release counts, label summary, and detected gaps.
+
+    Call this INSTEAD of pulling a discography into your context. It is a few
+    hundred tokens and contains what you need to write an overview paragraph.
+    Do not follow it with `get_artist_discography` — the release rows go
+    straight into the page via `build_article`, and you do not need to see
+    them.
+
+    `discogs_dry: true` means Discogs has nothing; pass the target to
+    `build_article` and it will flag the page and stop."""
+    folder, name = stubgen._split_target(target)
+    if folder is None:
+        return {"resolved": False, "warnings": ["expected 'Folder/Name'"]}
+    return article.facts(_CONN, folder, name)
+
+
+@mcp.tool
+@_log_call
+def build_article(
+    target: str,
+    overview: str = "",
+    questions: Optional[list[str]] = None,
+    stub_links: bool = True,
+    backlinks: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """Write the full vault article for `target` (`Folder/Name`), replacing a
+    stub. Everything except your prose is generated from Discogs: releases or
+    catalogue table, members, label summary, roster, connections with
+    wiki-links, and the Discogs-ID/credits/styles header.
+
+    Supply `overview` (the paragraph you wrote from `article_facts`) and
+    `questions` (Research Queue entries — concrete and single-source-
+    resolvable; anything Discogs can answer is not a question). Detected gaps
+    are appended automatically.
+
+    Also does, so you don't have to:
+    - **Stubs** for newly linked entities, gated by the vault's rules — labels
+      need >1 release, people and bands need >1 credit and a footprint beyond
+      this entity. Dead links beat low-value stubs, so the rest are left.
+    - **Back-link repair** across the vault, linking bare mentions of the
+      entity. Multi-word names only; single-word names like Low or Swans are
+      skipped as too risky to auto-link.
+
+    Returns counts, not content: `{ok, bytes, releases_listed, stubs:{...},
+    backlinks:{...}}`. Pass `dry_run=true` to preview without writing."""
+    return article.build(
+        _CONN, VAULT_PATH, target, overview, questions, stub_links, backlinks, dry_run
+    )
 
 
 if __name__ == "__main__":

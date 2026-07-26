@@ -30,6 +30,8 @@ the `custom` key — no `.mcp.json` edits needed.
 | `search_wikipedia(query, limit=10)` | Full-text search over the offline Wikipedia ZIM. Returns `{title, path, snippet}` hits. |
 | `get_wikipedia_article(title, max_chars=40000)` | Fetch one article as clean plain text (redirects resolved, chrome stripped). Miss → `{found:False, suggestions}`. |
 | `write_stubs(targets, dry_run=False)` | Write deterministic vault stubs for `Folder/Name` targets. Never overwrites; returns `discovered` links to feed back in. |
+| `article_facts(target)` | Compact fact sheet (~250–500 tokens) for writing a full article from — counts, eras, collaborators, labels, gaps. |
+| `build_article(target, overview, questions, ...)` | Write the full article: tables, members, labels, connections, gated stubs, back-link repair. Returns counts, not content. |
 
 The two `*_wikipedia` tools read a local Kiwix ZIM (text-only English Wikipedia) via
 libzim — an offline snapshot, not the live web. They boot lazily: if the ZIM is
@@ -106,6 +108,38 @@ New stubs link to entities that may not have pages yet; those come back in
 `discovered` is empty, otherwise the run leaves dead links behind.
 
 Requires the vault mounted read-write at `/vault` (override with `VAULT_PATH`).
+
+## Full articles (`article_facts` + `build_article`)
+
+The hourly stub trawl spent ~94% of its tokens on cache reads — the agent
+pulled ~180k tokens of Discogs payloads into context and re-read them each
+turn, largely to retype rows as markdown tables. Output was 0.3% of the spend.
+
+These two tools move that work next to the database:
+
+1. `article_facts(target)` returns a few hundred tokens — identity, total
+   credits, releases per decade, top styles, members, top collaborators with
+   shared-release counts, label summary, detected gaps. Enough to write an
+   overview paragraph from. **Do not follow it with `get_artist_discography`**;
+   the release rows go straight into the page and never need to be seen.
+2. `build_article(target, overview, questions)` writes the article. Everything
+   but the prose is generated: releases/catalogue table, members, label
+   summary, roster, connections, and the Discogs header. It also creates stubs
+   for newly linked entities and repairs back-links across the vault.
+
+Depth rules match the trawler brief — primary credits only past 50, capped at
+40 releases, full catalogue for labels under 1,000 releases.
+
+Stub creation is gated the same way the brief gates it: labels need more than
+one release, people and bands need more than one credit *and* a footprint
+beyond the entity being written about. Dead links beat low-value stubs.
+
+Back-link repair only touches **multi-word** names. The vault has pages called
+Low, Suicide, Swans and Wire; a bare-word replace across 17,650 files would
+rewrite ordinary prose into links with no undo.
+
+`discogs_dry: true` in the fact sheet means Discogs has nothing — `build_article`
+flags the page's frontmatter, leaves the stub marker, and stops.
 
 ## Build and run
 

@@ -1,0 +1,410 @@
+"""Deterministic full-article assembly for the bands-research vault.
+
+The hourly stub trawl spends ~94% of its tokens on cache reads: the agent pulls
+~180k tokens of Discogs payloads into context and re-reads them every turn,
+mostly to retype rows as markdown tables. Only ~0.3% of the spend is output.
+
+This moves the table-building next to the database. Two calls:
+
+    facts(...)  → a few hundred tokens: counts, eras, top labels, members,
+                  collaborators, detected gaps. Enough to write prose from.
+    build(...)  → writes the article, with the caller's overview and questions
+                  slotted into an otherwise query-generated page.
+
+The model never sees a release row. It writes the overview paragraph and the
+Research Queue questions — the two things a query genuinely cannot produce.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Any, Optional
+
+import queries as Q
+import stubgen
+
+# Depth rules from the trawler brief: a representative selection beats an
+# exhaustive dump for prolific artists, and a small label deserves its whole
+# catalogue.
+BIG_CATALOG = 50
+SELECT_CAP = 40
+BIG_LABEL = 1000
+
+
+def _first(d: dict, *names, default=None):
+    for n in names:
+        if d.get(n) is not None:
+            return d[n]
+    return default
+
+
+# ─── fact gathering ──────────────────────────────────────────────────────
+
+
+def _artist_releases(conn, artist_id: int, credit_count: int) -> list[dict]:
+    """Significant releases, newest ordering left to the caller.
+
+    Past BIG_CATALOG credits we switch to primary credits only — the brief's
+    rule for session players, whose guest appearances would otherwise swamp
+    their own work.
+    """
+    as_main_only = credit_count > BIG_CATALOG
+    rows = Q.get_artist_discography(conn, artist_id, None, as_main_only, None, True)
+    if len(rows) > SELECT_CAP:
+        # Prefer the artist's own releases, then earliest pressing.
+        rows.sort(key=lambda r: (not _first(r, "as_primary", default=False), _first(r, "year", default=9999) or 9999))
+        rows = rows[:SELECT_CAP]
+    rows.sort(key=lambda r: (_first(r, "year", default=9999) or 9999, r.get("title") or ""))
+    return rows
+
+
+def _label_releases(conn, label_id: int, total: int) -> list[dict]:
+    rows = Q.get_label_releases(conn, label_id, None, True)
+    if total >= BIG_LABEL and len(rows) > SELECT_CAP:
+        rows = rows[:SELECT_CAP]
+    return rows
+
+
+def _eras(rows: list[dict]) -> list[dict]:
+    """Release counts per decade — the shape of a career, in ~20 tokens."""
+    tally: dict[int, int] = {}
+    for r in rows:
+        y = _first(r, "year", "released_year")
+        if y:
+            tally[(int(y) // 10) * 10] = tally.get((int(y) // 10) * 10, 0) + 1
+    return [{"decade": d, "releases": n} for d, n in sorted(tally.items())]
+
+
+def _collaborators(conn, artist_id: int, limit: int = 12) -> list[dict]:
+    """Most-shared co-credits. A direct join, not the BFS in find_collaborators —
+    depth-1 is all an article needs and the BFS is far more expensive."""
+    cur = conn.execute(
+        f"""
+        SELECT a.name, COUNT(DISTINCT ras.release_id) n
+          FROM release_artist_slim me
+          JOIN release_artist_slim ras ON ras.release_id = me.release_id
+          JOIN artist a ON a.id = ras.artist_id
+         WHERE me.artist_id = ? AND ras.artist_id <> ?
+           AND ras.artist_id NOT IN ({','.join(map(str, stubgen.SPECIAL_ARTIST_IDS))})
+         GROUP BY 1 HAVING COUNT(DISTINCT ras.release_id) > 1
+         ORDER BY n DESC, a.name LIMIT ?
+        """,
+        [artist_id, artist_id, limit],
+    )
+    return [{"name": r[0], "shared": r[1]} for r in cur.fetchall()]
+
+
+def _label_summary(conn, artist_id: int, limit: int = 12) -> list[dict]:
+    cur = conn.execute(
+        """
+        SELECT rl.label_name, COUNT(DISTINCT r.id) n,
+               MIN(r.released_year) y0, MAX(r.released_year) y1
+          FROM release_artist_slim ras
+          JOIN release r ON r.id = ras.release_id
+          JOIN release_label rl ON rl.release_id = r.id
+         WHERE ras.artist_id = ? AND rl.label_name IS NOT NULL
+           AND rl.label_name NOT ILIKE 'Not On Label%' AND r.released_year > 0
+         GROUP BY 1 HAVING COUNT(DISTINCT r.id) >= 2
+         ORDER BY n DESC, rl.label_name LIMIT ?
+        """,
+        [artist_id, limit],
+    )
+    return [{"name": r[0], "releases": r[1], "years": f"{r[2]}–{r[3]}"} for r in cur.fetchall()]
+
+
+def facts(conn, folder: str, name: str) -> dict[str, Any]:
+    """Compact fact sheet — everything needed to write an overview, nothing more."""
+    entity_id, warnings = stubgen.resolve(conn, folder, name)
+    if entity_id is None:
+        return {"resolved": False, "target": f"{folder}/{name}", "warnings": warnings}
+
+    if folder == "Labels":
+        f = stubgen._label_facts(conn, entity_id)
+        rows = _label_releases(conn, entity_id, f["credit_count"] or 0)
+        out = {
+            "kind": "label",
+            "parent": f.get("parent_name"),
+            "sublabels": f.get("sublabels"),
+            "roster": f.get("roster"),
+        }
+    else:
+        f = stubgen._artist_facts(conn, entity_id)
+        rows = _artist_releases(conn, entity_id, f["credit_count"] or 0)
+        out = {
+            "kind": f["kind"],
+            "realname": f.get("realname"),
+            "members": f.get("members"),
+            "member_of": f.get("member_of"),
+            "roles": f.get("roles"),
+            "collaborators": _collaborators(conn, entity_id),
+            "labels": _label_summary(conn, entity_id),
+        }
+
+    out.update(
+        {
+            "resolved": True,
+            "target": f"{folder}/{name}",
+            "id": entity_id,
+            "name": f["name"],
+            "total_credits": f.get("credit_count"),
+            "selected_releases": len(rows),
+            "first_year": f.get("year_min"),
+            "styles": f.get("styles"),
+            "eras": _eras(rows),
+            "has_profile": bool(f.get("profile")),
+            "gaps": stubgen._gaps(f),
+            "discogs_dry": not rows and not f.get("credit_count"),
+        }
+    )
+    return out
+
+
+# ─── rendering ───────────────────────────────────────────────────────────
+
+
+def _esc(s: Any) -> str:
+    return str(s or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _release_table(rows: list[dict], kind: str) -> list[str]:
+    if not rows:
+        return []
+    head = (
+        ["| Release | Year | Artists | Cat # |", "|---|---|---|---|"]
+        if kind == "label"
+        else ["| Release | Year | Label | Role |", "|---|---|---|---|"]
+    )
+    body = []
+    for r in rows:
+        year = _first(r, "year", "released_year", default="—")
+        if kind == "label":
+            body.append(
+                f"| *{_esc(r.get('title'))}* | {year} | {_esc(_first(r,'primary_artists','artists'))} | {_esc(r.get('catno'))} |"
+            )
+        else:
+            body.append(
+                f"| *{_esc(r.get('title'))}* | {year} | {_esc(r.get('labels'))} | {_esc(r.get('role')) or '—'} |"
+            )
+    return head + body
+
+
+def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str], index: dict) -> str:
+    L = ["---", "sources: discogs", "---", "", f"# {fx['name']}", ""]
+
+    if overview:
+        L += ["## Overview", "", overview.strip(), ""]
+
+    meta = [f"**Discogs ID:** {fx['id']}"]
+    if fx.get("realname"):
+        meta.append(f"**Real name:** {fx['realname']}")
+    if fx.get("first_year"):
+        meta.append(f"**First Discogs release:** {fx['first_year']}")
+    if fx.get("total_credits"):
+        meta.append(f"**Total Discogs credits:** {fx['total_credits']:,}")
+    if fx.get("styles"):
+        meta.append(f"**Top styles:** {'; '.join(fx['styles'])}")
+    L += ["  \n".join(meta), ""]
+
+    label = "Catalogue" if fx["kind"] == "label" else "Releases"
+    table = _release_table(rows, fx["kind"])
+    if table:
+        note = (
+            f" — {fx['selected_releases']} of {fx['total_credits']:,} credits, "
+            "most significant first"
+            if (fx.get("total_credits") or 0) > fx["selected_releases"]
+            else ""
+        )
+        L += [f"## {label}{note}", "", *table, ""]
+
+    if fx.get("members"):
+        L += ["## Members", ""] + [
+            f"- {stubgen._link(conn, m, 'person', index)}" for m in fx["members"]
+        ] + [""]
+
+    if fx.get("labels"):
+        L += ["## Labels", "", "| Label | Releases | Years |", "|---|---|---|"] + [
+            f"| {stubgen._link(conn, l['name'], 'label', index)} | {l['releases']} | {l['years']} |"
+            for l in fx["labels"]
+        ] + [""]
+
+    if fx.get("roster"):
+        L += ["## Roster", ""] + [
+            f"- {stubgen._link(conn, a, 'person', index)}" for a in fx["roster"]
+        ] + [""]
+
+    conns = []
+    if fx.get("parent"):
+        conns.append(f"- {stubgen._link(conn, fx['parent'], 'label', index)} — parent label")
+    for s in fx.get("sublabels") or []:
+        conns.append(f"- {stubgen._link(conn, s, 'label', index)} — sublabel")
+    for g in fx.get("member_of") or []:
+        conns.append(f"- {stubgen._link(conn, g, 'group', index)} — member of")
+    # Bandmates already have their own section; repeating them as
+    # "collaborators" is noise, and they always top the shared-release count.
+    listed = set(fx.get("members") or []) | set(fx.get("member_of") or []) | set(fx.get("roster") or [])
+    for c in fx.get("collaborators") or []:
+        if c["name"] in listed:
+            continue
+        conns.append(
+            f"- {stubgen._link(conn, c['name'], 'person', index)} — {c['shared']} shared releases"
+        )
+    if conns:
+        L += ["## Connections", "", *conns, ""]
+
+    all_q = list(questions or []) + [f"{g} — verify off-Discogs" for g in fx.get("gaps") or []]
+    if all_q:
+        L += ["## Research Queue", ""] + [f"- [ ] {q}" for q in all_q] + [""]
+
+    return "\n".join(L).rstrip() + "\n"
+
+
+# ─── back-link repair ────────────────────────────────────────────────────
+
+# Single-word names are why this is guarded. The vault has pages called Low,
+# Suicide, Swans and Wire; a bare-word search-and-replace across 17,650 files
+# would rewrite ordinary prose into links and there is no undo.
+_SAFE_NAME = re.compile(r"^[\w'’.&-]+(?: [\w'’.&-]+)+$", re.UNICODE)
+
+
+def repair_backlinks(vault: str, folder: str, name: str, skip: str) -> dict:
+    """Link bare mentions of `name` across the vault. Multi-word names only."""
+    if not _SAFE_NAME.match(name):
+        return {"repaired": 0, "skipped_reason": "single-word name — too risky to auto-link"}
+
+    target = f"[[{folder}/{name}]]"
+    # Not already inside a wiki-link, and not part of a longer word.
+    pat = re.compile(r"(?<!\[\[)(?<![\w|/])" + re.escape(name) + r"(?![\w|\]])")
+    changed = 0
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = [d for d in dirs if not d.startswith((".", "_"))]
+        for fn in files:
+            if not fn.endswith(".md") or fn.startswith("_"):
+                continue
+            path = os.path.join(root, fn)
+            if os.path.abspath(path) == os.path.abspath(skip):
+                continue
+            try:
+                text = open(path, encoding="utf-8").read()
+            except OSError:
+                continue
+            new, n = pat.subn(target, text)
+            if n:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(new)
+                stubgen._match_dir_owner(path)
+                changed += n
+    return {"repaired": changed}
+
+
+# ─── stub gating ─────────────────────────────────────────────────────────
+
+
+def _stub_worthy(conn, target: str, subject_id: int) -> bool:
+    """The brief's rule: dead links beat low-value stubs.
+
+    A label needs more than one release. A person or band needs more than one
+    credit *and* a footprint beyond the entity being written about — otherwise
+    they are a one-off session player on this record and the stub would say
+    nothing the article doesn't already.
+    """
+    folder, name = stubgen._split_target(target)
+    if folder == "Labels":
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT rl.release_id) FROM release_label rl
+             JOIN label l ON l.id = rl.label_id WHERE l.name = ?
+            """,
+            [name],
+        ).fetchone()
+        return bool(row and row[0] > 1)
+
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT ras.release_id),
+               COUNT(DISTINCT ras.release_id) FILTER (
+                   WHERE ras.release_id NOT IN (
+                       SELECT release_id FROM release_artist_slim WHERE artist_id = ?
+                   )
+               )
+          FROM release_artist_slim ras
+          JOIN artist a ON a.id = ras.artist_id
+         WHERE a.name = ?
+        """,
+        [subject_id, name],
+    ).fetchone()
+    return bool(row and row[0] > 1 and row[1] > 0)
+
+
+# ─── entry point ─────────────────────────────────────────────────────────
+
+
+def build(
+    conn,
+    vault: str,
+    target: str,
+    overview: str = "",
+    questions: Optional[list[str]] = None,
+    stub_links: bool = True,
+    backlinks: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    folder, name = stubgen._split_target(target)
+    if folder is None:
+        return {"ok": False, "why": "expected 'Folder/Name'"}
+
+    fx = facts(conn, folder, name)
+    if not fx["resolved"]:
+        return {"ok": False, "why": "; ".join(fx["warnings"]), "target": target}
+
+    path = os.path.join(vault, folder, name + ".md")
+
+    # Discogs has nothing: leave the stub marker in place and flag the page so
+    # the trawl doesn't keep selecting it.
+    if fx["discogs_dry"]:
+        if not dry_run and os.path.exists(path):
+            text = open(path, encoding="utf-8").read()
+            if "discogs_dry" not in text:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("---\nsources: discogs_dry\ndiscogs_dry: true\n---\n\n" + text)
+                stubgen._match_dir_owner(path)
+        return {"ok": True, "discogs_dry": True, "target": target, "written": False}
+
+    index = stubgen.read_index(vault)
+    rows = (
+        _label_releases(conn, fx["id"], fx["total_credits"] or 0)
+        if folder == "Labels"
+        else _artist_releases(conn, fx["id"], fx["total_credits"] or 0)
+    )
+    content = render(conn, fx, rows, overview, questions or [], index)
+
+    if not dry_run:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        stubgen._match_dir_owner(path)
+
+    result = {
+        "ok": True,
+        "target": target,
+        "written": not dry_run,
+        "bytes": len(content),
+        "releases_listed": len(rows),
+    }
+
+    if stub_links:
+        linked = sorted(set(stubgen._LINK.findall(content)))
+        missing = [
+            t
+            for t in linked
+            if stubgen._split_target(t)[0]
+            and not os.path.exists(os.path.join(vault, t + ".md"))
+        ]
+        worthy = [t for t in missing if _stub_worthy(conn, t, fx["id"])]
+        result["stubs"] = stubgen.write_stubs(conn, vault, worthy, dry_run=dry_run)
+        result["stubs"]["gated_out"] = len(missing) - len(worthy)
+
+    if backlinks and not dry_run:
+        result["backlinks"] = repair_backlinks(vault, folder, name, skip=path)
+
+    return result
