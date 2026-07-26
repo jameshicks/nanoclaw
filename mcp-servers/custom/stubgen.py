@@ -17,6 +17,7 @@ a question here — we have the discography; if it is wanted, run the query.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Any, Optional
@@ -375,6 +376,95 @@ def build(conn, folder: str, name: str, index: dict[str, set]) -> dict[str, Any]
         "id": entity_id,
         "content": render(conn, facts, index),
         "warnings": warnings,
+    }
+
+
+# ─── vault I/O ───────────────────────────────────────────────────────────
+
+FOLDERS = ("Bands", "People", "Labels")
+_LINK = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
+
+
+def read_index(vault: str) -> dict[str, set]:
+    """Every page that already exists, so links land on real files."""
+    index = {}
+    for folder in FOLDERS:
+        d = os.path.join(vault, folder)
+        index[folder] = (
+            {f[:-3] for f in os.listdir(d) if f.endswith(".md")}
+            if os.path.isdir(d)
+            else set()
+        )
+    return index
+
+
+def _match_dir_owner(path: str) -> None:
+    """Give a new stub the same owner as the folder holding it.
+
+    This process runs as root inside the container, so a freshly written file
+    lands as root:root on the host bind mount. The agent container runs
+    unprivileged and would then be unable to build the stub into a full
+    article — the exact next step in the pipeline. Best-effort: silently skip
+    when not permitted (e.g. running as a non-root user already).
+    """
+    try:
+        st = os.stat(os.path.dirname(path))
+        os.chown(path, st.st_uid, st.st_gid)
+    except (OSError, AttributeError):
+        pass
+
+
+def _split_target(target: str) -> tuple[Optional[str], str]:
+    folder, _, name = target.partition("/")
+    return (folder, name) if folder in FOLDERS and name else (None, target)
+
+
+def write_stubs(conn, vault: str, targets: list[str], dry_run: bool = False) -> dict:
+    """Generate and write a stub per target. Targets are `Folder/Name`.
+
+    Never overwrites. An existing page may be a finished article, and silently
+    replacing one with a stub would destroy work that cannot be recovered from
+    Discogs — so anything already on disk is skipped and reported.
+    """
+    index = read_index(vault)
+    written, skipped, unresolved, discovered = [], [], [], set()
+
+    for target in targets:
+        folder, name = _split_target(target)
+        if folder is None:
+            unresolved.append({"target": target, "why": "expected 'Folder/Name'"})
+            continue
+
+        path = os.path.join(vault, folder, name + ".md")
+        if os.path.exists(path):
+            skipped.append(target)
+            continue
+
+        result = build(conn, folder, name, index)
+        if not result["resolved"]:
+            unresolved.append({"target": target, "why": "; ".join(result["warnings"])})
+            continue
+
+        if not dry_run:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(result["content"])
+            _match_dir_owner(path)
+            index[folder].add(name)
+        written.append(target)
+
+        # Links to pages that still don't exist are the next round's work.
+        for link in _LINK.findall(result["content"]):
+            lf, ln = _split_target(link)
+            if lf and ln not in index[lf]:
+                discovered.add(link)
+
+    return {
+        "written": len(written),
+        "skipped_existing": len(skipped),
+        "unresolved": unresolved,
+        "discovered": sorted(discovered),
+        "dry_run": dry_run,
     }
 
 

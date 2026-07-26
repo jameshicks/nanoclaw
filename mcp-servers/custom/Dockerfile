@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # fails.
 RUN python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL fts'); c.execute('LOAD fts')"
 
-COPY server.py queries.py sql_guard.py wikipedia.py ./
+COPY server.py queries.py sql_guard.py wikipedia.py stubgen.py ./
 
-VOLUME ["/data", "/logs"]
+VOLUME ["/data", "/logs", "/vault"]
 
 EXPOSE 8765
 

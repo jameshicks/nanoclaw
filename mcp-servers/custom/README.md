@@ -29,6 +29,7 @@ the `custom` key — no `.mcp.json` edits needed.
 | `run_readonly_sql(query, row_limit=1000)` | sqlglot-validated SELECT-only escape hatch |
 | `search_wikipedia(query, limit=10)` | Full-text search over the offline Wikipedia ZIM. Returns `{title, path, snippet}` hits. |
 | `get_wikipedia_article(title, max_chars=40000)` | Fetch one article as clean plain text (redirects resolved, chrome stripped). Miss → `{found:False, suggestions}`. |
+| `write_stubs(targets, dry_run=False)` | Write deterministic vault stubs for `Folder/Name` targets. Never overwrites; returns `discovered` links to feed back in. |
 
 The two `*_wikipedia` tools read a local Kiwix ZIM (text-only English Wikipedia) via
 libzim — an offline snapshot, not the live web. They boot lazily: if the ZIM is
@@ -77,19 +78,49 @@ in place and point `WIKIPEDIA_ZIM_PATH` at it (or match the default filename), t
 restart the container. No FTS build step — the ZIM ships its own Xapian full-text
 index.
 
+## Vault stubs (`write_stubs`)
+
+Stub pages are almost entirely derivable — Discogs ID, real name, first release
+year, credit count, top styles/labels, credited roles, band membership, label
+parent/sublabels/roster — so `write_stubs` builds them with no model involved.
+Because it runs here, next to the database, the rows never pass through an
+agent's context: the caller sends names and gets back counts.
+
+The Research Queue it emits is gap-derived — a question appears only when the
+field is genuinely missing from Discogs. It never asks for something we can
+already answer with a query.
+
+Two safety properties worth knowing:
+
+- **It never overwrites.** An existing page may be a finished article, and
+  replacing one with a stub would destroy work Discogs cannot regenerate.
+  Existing targets are skipped and counted.
+- **It never guesses an ID.** A name that doesn't match Discogs exactly comes
+  back in `unresolved` with candidate spellings.
+
+Output is idempotent: every ranked list has a tiebreak, so re-running over an
+unchanged database produces byte-identical files.
+
+New stubs link to entities that may not have pages yet; those come back in
+`discovered`. Feed them in as the next call's `targets` and repeat until
+`discovered` is empty, otherwise the run leaves dead links behind.
+
+Requires the vault mounted read-write at `/vault` (override with `VAULT_PATH`).
+
 ## Build and run
 
 ```bash
 docker build -t nanoclaw-discogs-mcp mcp-servers/custom
 
-docker run -d --name nanoclaw-discogs-mcp \
+docker run -d --name mcp-custom \
   --restart=unless-stopped \
   -v ~/projects/discogs_db:/data:ro \
   -v ~/discogs-mcp-logs:/logs \
+  -v ~/nanoclaw/nanoclaw/groups/whatsapp_main/bands-research:/vault \
   -p 8765:8765 \
   nanoclaw-discogs-mcp
 
-docker logs -f nanoclaw-discogs-mcp
+docker logs -f mcp-custom
 ```
 
 Per-tool-invocation query logs are appended to `~/discogs-mcp-logs/queries.jsonl`

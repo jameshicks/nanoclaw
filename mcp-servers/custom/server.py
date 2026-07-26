@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 
 import queries as Q
 import sql_guard
+import stubgen
 import wikipedia as W
 
 
@@ -659,6 +660,38 @@ def get_wikipedia_article(title: str, max_chars: int = 40000) -> dict:
     `max_chars` (default 40000) truncates very long articles; clamped to
     [500, 200000]. Local June-2026 snapshot, not the live web."""
     return W.get_article(title, max_chars)
+
+
+VAULT_PATH = os.environ.get("VAULT_PATH", "/vault")
+
+
+@mcp.tool
+@_log_call
+def write_stubs(targets: list[str], dry_run: bool = False) -> dict:
+    """Write deterministic vault stubs for a list of `Folder/Name` targets
+    (e.g. `["Bands/The Police", "Labels/Dindisc"]`; folder is one of Bands,
+    People, Labels). Each stub is built entirely from Discogs — ID, real name,
+    first release year, credit count, top styles/labels, credited roles, band
+    membership, label parent/sublabels/roster — plus a gap-derived Research
+    Queue listing only fields Discogs actually lacks.
+
+    Use this instead of writing stubs yourself. The rows never enter your
+    context: pass names, get back counts. Returns `{written, skipped_existing,
+    unresolved:[{target, why}], discovered:[...], dry_run}`.
+
+    **Never overwrites.** A target that already has a page is skipped and
+    counted in `skipped_existing`, because it may be a finished article.
+    Names that don't match Discogs exactly are reported in `unresolved` with
+    candidate spellings rather than guessed at.
+
+    `discovered` lists pages these stubs now link to that still don't exist —
+    feed it straight back in as the next call's `targets` to close the loop,
+    repeating until `discovered` comes back empty. Pass `dry_run=true` to see
+    what would happen without writing.
+
+    Does NOT write scene/genre prose or a releases table — this is the factual
+    skeleton only."""
+    return stubgen.write_stubs(_CONN, VAULT_PATH, targets, dry_run)
 
 
 if __name__ == "__main__":
