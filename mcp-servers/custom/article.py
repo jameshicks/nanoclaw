@@ -419,6 +419,16 @@ def _protected_spans(text: str) -> list[tuple[int, int]]:
         r"`[^`\n]+`",
         r"\[\[[^\]]*\]\]",
         r"\]\([^)]*\)",
+        # Headings are structure, not prose. Every page in this vault carries a
+        # "## Research Queue" heading, and there is a page called Research
+        # Queue — without this, linking it rewrites five thousand headings.
+        r"(?m)^#{1,6} .*$",
+        # Table header separators and the bold key of a `**Key:** value` line.
+        r"(?m)^\*\*[^*]+:\*\*",
+        # Release titles are italicised throughout this vault, and a release
+        # often shares its name with an act — *Ghost Dance* on a credits line
+        # is Ken McMullen's film score, not the band Ghost Dance.
+        r"(?<!\*)\*[^*\n]+\*(?!\*)",
     ):
         spans += [m.span() for m in re.finditer(pat, text)]
     return spans
@@ -633,6 +643,47 @@ def _stub_worthy(conn, target: str, subject_id: int) -> bool:
     return bool(row and row[0] > 1 and row[1] > 0)
 
 
+def inbound_count(vault: str, target: str, skip: str = "") -> int:
+    """How many pages link `target`. Used to tell a real orphan from a page
+    that simply lost one of several references."""
+    n = 0
+    needle = f"[[{target}"
+    for root, dirs, fnames in os.walk(vault):
+        dirs[:] = [d for d in dirs if not d.startswith((".", "_"))]
+        for fn in fnames:
+            if not fn.endswith(".md") or fn.startswith("_"):
+                continue
+            p = os.path.join(root, fn)
+            if os.path.abspath(p) == os.path.abspath(skip):
+                continue
+            try:
+                if needle in open(p, encoding="utf-8", errors="ignore").read():
+                    n += 1
+            except OSError:
+                continue
+    return n
+
+
+def _reconnect_dropped(conn, vault: str, dropped: list[str], skip: str) -> dict:
+    """Re-link pages this rewrite orphaned, and name the ones still stranded."""
+    relinked, still_orphan, kept = [], [], 0
+    for target in dropped:
+        folder, tname = stubgen._split_target(target)
+        if folder is None or not os.path.exists(os.path.join(vault, target + ".md")):
+            continue
+        if inbound_count(vault, target, skip=skip) > 0:
+            kept += 1  # something else still links it
+            continue
+        res = repair_backlinks(vault, folder, tname, skip=skip)
+        (relinked if res.get("repaired") else still_orphan).append(target)
+    return {
+        "dropped": len(dropped),
+        "still_linked_elsewhere": kept,
+        "relinked": relinked,
+        "orphaned": still_orphan,
+    }
+
+
 # ─── entry point ─────────────────────────────────────────────────────────
 
 
@@ -655,6 +706,17 @@ def build(
         return {"ok": False, "why": "; ".join(fx["warnings"]), "target": target}
 
     path = os.path.join(vault, folder, name + ".md")
+
+    # What the page linked before we replace it. Regenerating drops whatever
+    # the new queries no longer surface, and any stub created by an earlier run
+    # of this tool is the likeliest casualty — improving the collaborator
+    # filter orphaned seven pages the previous Police article had created.
+    prior_links: set[str] = set()
+    if os.path.exists(path):
+        try:
+            prior_links = set(stubgen._LINK.findall(open(path, encoding="utf-8").read()))
+        except OSError:
+            pass
 
     # Discogs has nothing: leave the stub marker in place and flag the page so
     # the trawl doesn't keep selecting it.
@@ -700,6 +762,13 @@ def build(
         worthy = [t for t in missing if _stub_worthy(conn, t, fx["id"])]
         result["stubs"] = stubgen.write_stubs(conn, vault, worthy, dry_run=dry_run)
         result["stubs"]["gated_out"] = len(missing) - len(worthy)
+
+    # Anything this page used to link and no longer does. If nothing else in
+    # the vault links it either, it is now an orphan we made — so try to
+    # reconnect it where it is genuinely mentioned, and report what is left.
+    dropped = sorted(prior_links - set(stubgen._LINK.findall(content)))
+    if dropped and not dry_run:
+        result["dropped_links"] = _reconnect_dropped(conn, vault, dropped, skip=path)
 
     if backlinks and not dry_run:
         associates = (
