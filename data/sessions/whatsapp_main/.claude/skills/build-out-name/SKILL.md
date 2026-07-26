@@ -1,13 +1,13 @@
 ---
 name: build-out-name
-description: End-to-end macro for researching a name (artist, band, label, or release) and writing a full vault article with stubs for everyone it mentions. Use whenever the user says "build out X", "research X", "look into X", or asks for a full writeup on a specific music name. Relies on the discogs-research skill for MCP tool and SQL reference.
+description: End-to-end macro for researching a name (artist, band, label, or release) and writing a full vault article with stubs for everyone it mentions. Use whenever the user says "build out X", "research X", "look into X", or asks for a full writeup on a specific music name. Runs deterministically via the article_facts and build_article MCP tools — no discography pulled into context, no subagent.
 ---
 
 # Build Out Name — Research Macro
 
 One named sequence that takes a music name from zero → full vault article → stubs for every connection → summary and web-search ask. Codifies the multi-step workflow so it survives context compaction.
 
-Load `discogs-research` for MCP tool signatures, SQL patterns, and article/stub formats. This skill is the sequence; that skill is the reference.
+The build-out itself is two tool calls — `article_facts` then `build_article`. The tables, stubs, back-links, depth rules and stub gating all live in the MCP server now, so this skill is the sequence and the judgement, not a tool reference. You do **not** need to load `discogs-research` for a build-out; load it only if you end up doing wider research through `discogs-trawler`.
 
 ---
 
@@ -22,83 +22,70 @@ Load `discogs-research` for MCP tool signatures, SQL patterns, and article/stub 
    ```
    Pick the highest-confidence match. If results are equally plausible (e.g. a label and a band share the name), ask the user which one.
 
-## Phase 1 — Exhaust Discogs
-
-Follow the **Discogs-first, web-on-permission** hard rule (see CLAUDE.md). Do not call WebSearch, WebFetch, or agent-browser in this phase.
-
-### Artist or band
+## Phase 1 — Fact sheet
 
 ```
-get_artist(id)                                          # profile, aliases, members, groups
-get_artist_discography(id)     ──┐
-find_collaborators(id)           ├── in parallel
-list_compilations_featuring_artist(id)  ──┘
+mcp__custom__article_facts("Folder/Name")
 ```
 
-Then for each of the top ~8 releases that look pivotal (era-defining, on a key label, heavily collaborated):
+Returns a few hundred tokens: Discogs ID, total credits, first year, releases
+per decade, top styles, members, bands they belong to, top collaborators with
+shared-release counts, label summary, and detected gaps.
+
+That is the whole research step. Do **not** call `get_artist_discography`,
+`get_release`, `get_label_releases`, `get_label_roster`, `find_collaborators`
+or `run_readonly_sql` alongside it. The release rows go straight into the page
+without passing through your context — that is the point of these tools, and
+pulling them yourself is what used to make a build-out cost about a dollar.
+
+If it returns `resolved: false`, the vault name does not match Discogs. It
+gives candidate spellings — report them and stop. Do not guess an ID.
+
+If it returns `discogs_dry: true`, call `build_article` with no overview: it
+flags the page's frontmatter, leaves the stub marker in place, and stops.
+
+## Phase 2 — Write the article
+
+From the fact sheet **alone**, write:
+
+- **overview** — 2 to 4 sentences. What they are, when active, which scene,
+  and what the shape of the catalogue says. Use `eras`, `styles`, `labels`,
+  `collaborators`, `members`. State only what the data supports.
+- **questions** — Research Queue entries. Each must be answerable from **one**
+  authoritative page. Never ask anything Discogs can answer — discography,
+  roster, founding year, catalogue numbers, label structure. Zero questions is
+  a fine answer; one vague question is not.
+
+Then:
 
 ```
-get_release(release_id)   # full personnel
+mcp__custom__build_article("Folder/Name", overview=..., questions=[...])
 ```
 
-Walk aliases and member IDs recursively — one hop deep minimum. Capture every Discogs ID you touch.
+It writes the release or catalogue table, members, label summary, roster,
+connections with wiki-links, and the Discogs header. It returns counts, not
+content — do not read the article back to check it.
 
-### Label
+Target folders are unchanged: `Bands/`, `People/`, `Labels/`, `Releases/`,
+`Topics/`. Filenames use the Discogs display name with spaces.
 
-```
-get_label(id)                                           # profile, parent, sublabels
-get_label_roster(id)       ──┐
-get_label_releases(id)       ├── in parallel
-```
+**Never run this over an existing full article.** `build_article` overwrites,
+and a trawler-written or web-researched page carries prose that Discogs cannot
+regenerate. Build out stubs, not finished work.
 
-Then `get_release(id)` for the 5–10 most significant catalog entries.
+## Phase 3 — Stubs and back-links (automatic)
 
-### Release
+`build_article` already did both:
 
-```
-get_release(id)            # full credits
-```
+- **Stubs** for newly linked entities, gated by the vault rules — labels need
+  more than one release, people and bands need more than one credit and a
+  footprint beyond this entity. Dead links beat low-value stubs, so the rest
+  are deliberately left unlinked. The returned `stubs.gated_out` counts them.
+- **Back-link repair** across the vault. Multi-word names are linked on sight;
+  single-word names (Low, Swans, Wire) only on pages that corroborate the
+  subject, so ordinary prose is never rewritten.
 
-Then `get_artist(id)` for each credited person whose role is non-trivial (composer, producer, core personnel — not every tape-op).
-
----
-
-## Phase 2 — Write the main article
-
-Target path:
-- Artist/band → `/workspace/group/bands-research/Bands/<Name>.md` (bands) or `People/<Name>.md` (solo artists)
-- Label → `/workspace/group/bands-research/Labels/<Name>.md`
-- Release → `/workspace/group/bands-research/Releases/<Name>.md`
-- Cross-cutting scene/concept → `/workspace/group/bands-research/Topics/<Name>.md`
-
-Filenames use the Discogs display name with spaces (not hyphens). See existing files like `Bush Tetras.md`, `99 Records.md`.
-
-Follow the full-article format from `discogs-research`: bio sections by era, personnel tables per key release, collaborators table, labels summary, connections with `[[wiki-links]]`, Open Questions.
-
-Use `[[Folder/Name]]` wiki-link form (matching `_Index.md` convention), or `[[Folder/Name|Display]]` when display text differs.
-
-## Phase 3 — Stub every mentioned name
-
-CLAUDE.md rule: **every person, band, and label mentioned deserves its own page — even with one or two facts.** Don't batch this for the end; do it as a final pass before summarizing.
-
-For each `[[...]]` link in the article whose target file doesn't exist:
-
-1. Decide the folder from context (person/band/label).
-2. Write a stub using the format in `discogs-research` — the short version:
-
-   ```markdown
-   # <Name>
-
-   <One-line intro: what they are, when active, Discogs ID if known>
-
-   <Short sentence placing them in context of the article that mentioned them>
-
-   ## Research Queue
-   - [ ] <specific open question 1>
-   - [ ] <specific open question 2>
-   ```
-
-Parallelize stub file writes — there's no ordering dependency.
+Nothing to do here. Do not write stubs by hand.
 
 ## Phase 4 — Summarize and gate the web search
 
@@ -116,13 +103,14 @@ If the user approves web research, supplement the article and stubs. If not, the
 
 ## Efficiency notes
 
-- Phase 1 parallelism matters — Discogs MCP calls are independent; fanning them out cuts wall time substantially.
-- Phase 3 stub writes can also parallel.
-- Don't collapse the whole macro into a silent run — send progress pings between Phase 1 and Phase 2 ("Discogs exhausted, writing article now") so the user isn't left guessing.
-- Every Discogs ID you've touched should end up in a file — either in the main article or in a stub. IDs are the fastest re-entry point for future sessions.
+- The whole macro is now two tool calls. There is nothing to parallelise and nothing to fan out.
+- Send one progress ping between Phase 1 and Phase 2 ("got the facts, writing it up") so the user isn't left guessing — the build call takes a few seconds.
+- The Discogs ID lands in the page header automatically; it is the fastest re-entry point for future sessions.
 
 ## Common mistakes
 
-- Skipping Phase 3 — leaves `[[dead links]]` that `vault-maintenance` will flag later. Cheaper to stub now.
-- Writing the main article before walking aliases/members — you'll miss the obvious collaborators and have to edit.
+- **Pulling a discography.** `article_facts` is the only lookup. Calling `get_artist_discography` "to see the releases" reintroduces the entire cost this macro was rewritten to remove — the rows are already going into the page.
+- **Running `build_article` over a finished article.** It overwrites. Prose from a trawler or web pass is unrecoverable. Check for `## Stub — needs full research` first.
+- **Writing stubs or fixing back-links by hand.** `build_article` does both, with gating and safety rules you will not reproduce manually.
+- **Reading the article back to verify.** Trust the returned counts.
 - Framing the web search as already-decided in Phase 4 ("I'll also check the web for…"). CLAUDE.md explicitly forbids this. Ask, wait.
