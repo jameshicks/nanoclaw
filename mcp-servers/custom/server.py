@@ -844,6 +844,7 @@ def build_article(
     stub_links: bool = True,
     backlinks: bool = True,
     dry_run: bool = False,
+    force: bool = False,
 ) -> dict:
     """Write the full vault article for `target` (`Folder/Name`), replacing a
     stub. Everything except your prose is generated from Discogs: releases or
