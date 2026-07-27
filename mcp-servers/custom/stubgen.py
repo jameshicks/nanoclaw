@@ -297,6 +297,29 @@ def resolve(conn, folder: str, name: str) -> tuple[Optional[int], list[str]]:
         if len(rows) > 1:
             return None, [f"ambiguous: {len(rows)} {table} rows matching {cand!r}"]
 
+    # Discogs' own name variations, which cover far more than hand-rolled rules
+    # can: accents (Füxa, Métal Urbain), punctuation (Songs: Ohia, M|A|R|R|S,
+    # Pan•American) and expansions (Public Image Ltd → Public Image Limited).
+    # Last, because the table is noisy — "Sisters" and "Banshees" are both
+    # listed — so a variation is only trusted when it points at one artist.
+    # No equivalent table exists for labels.
+    if table == "artist":
+        rows = conn.execute(
+            """
+            SELECT DISTINCT a.id, a.name
+              FROM artist_namevariation nv JOIN artist a ON a.id = nv.artist_id
+             WHERE lower(nv.name) = lower(?)
+            """,
+            [name],
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0][0], [f"matched Discogs name variation → {rows[0][1]!r}"]
+        if len(rows) > 1:
+            return None, [
+                f"ambiguous: {name!r} is a name variation of "
+                f"{len(rows)} artists ({', '.join(r[1] for r in rows[:3])})"
+            ]
+
     bare = _strip_disamb(name)
     near = conn.execute(
         f"SELECT name FROM {table} WHERE name = ? OR name ILIKE ? LIMIT 5",
