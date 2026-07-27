@@ -274,6 +274,97 @@ def _label_facts(conn, label_id: int) -> dict[str, Any]:
 # ─── resolution ──────────────────────────────────────────────────────────
 
 
+_PAREN = re.compile(r"\s*\(([^)]+)\)$")
+_KIND_HINTS = {"band", "group", "the band", "duo", "trio", "quartet", "orchestra", "ensemble"}
+
+
+def _resolve_hinted(conn, table: str, name: str) -> Optional[tuple[Optional[int], list[str]]]:
+    """Reconcile a hand-written disambiguator with Discogs' numeric ones.
+
+    The vault files bands as `Bradford (band)`, `King (Coventry)`,
+    `Hex (Ntone)`, `Foetus (JG Thirlwell)`. Discogs files the same entities as
+    `Bradford`, `Bradford (3)`, `Bradford (4)` — the parenthetical carries
+    meaning on one side and a serial number on the other, so neither matches.
+
+    The hint is used as evidence rather than as text: a kind word must be
+    backed by group membership, a label name by a release on that label, an
+    artist name by a shared credit, a place or role by the profile. A candidate
+    is returned only when exactly one is corroborated, so a name with eight
+    Discogs entries and no usable hint stays unresolved.
+
+    Returns None when this path does not apply, so resolve() falls through.
+    """
+    m = _PAREN.search(name)
+    if not m:
+        return None
+    hint = m.group(1).strip()
+    if not hint or re.fullmatch(r"\d+", hint):
+        return None
+    bare = _PAREN.sub("", name).strip()
+    if not bare:
+        return None
+
+    cands = conn.execute(
+        f"SELECT id, name FROM {table} WHERE lower(name) = lower(?) OR lower(name) LIKE lower(?)"
+        f" ORDER BY id LIMIT 12",
+        [bare, bare + " (%"],
+    ).fetchall()
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0][0], [f"matched Discogs name {cands[0][1]!r} via hint {hint!r}"]
+    if table != "artist":
+        return None
+
+    hl = hint.lower()
+    scored = []
+    for cid, cname in cands:
+        why = []
+        if hl in _KIND_HINTS:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM group_member WHERE group_artist_id = ?", [cid]
+            ).fetchone()[0]
+            if n:
+                why.append(f"is a group ({n} members)")
+        else:
+            on_label = conn.execute(
+                """
+                SELECT 1 FROM release_artist_slim ras JOIN release_label rl
+                    ON rl.release_id = ras.release_id
+                 WHERE ras.artist_id = ? AND lower(rl.label_name) = lower(?) LIMIT 1
+                """,
+                [cid, hint],
+            ).fetchone()
+            if on_label:
+                why.append(f"released on {hint!r}")
+            shared = conn.execute(
+                """
+                SELECT 1 FROM release_artist_slim me JOIN release_artist_slim other
+                    ON other.release_id = me.release_id
+                  JOIN artist a ON a.id = other.artist_id
+                 WHERE me.artist_id = ? AND lower(a.name) = lower(?) LIMIT 1
+                """,
+                [cid, hint],
+            ).fetchone()
+            if shared:
+                why.append(f"shares a release with {hint!r}")
+            prof = conn.execute(f"SELECT profile FROM {table} WHERE id = ?", [cid]).fetchone()[0]
+            if prof and hl in prof.lower():
+                why.append("hint appears in the Discogs profile")
+        if why:
+            scored.append((cid, cname, why))
+
+    if len(scored) == 1:
+        cid, cname, why = scored[0]
+        return cid, [f"matched Discogs name {cname!r} via hint {hint!r} — {'; '.join(why)}"]
+    if len(scored) > 1:
+        return None, [
+            f"hint {hint!r} fits {len(scored)} Discogs entries "
+            f"({', '.join(c[1] for c in scored[:3])})"
+        ]
+    return None
+
+
 def resolve(conn, folder: str, name: str) -> tuple[Optional[int], list[str]]:
     """Map a vault page to a Discogs id. Exact match only — a wrong id is worse
     than an unresolved stub, so near-misses are reported, never guessed."""
@@ -319,6 +410,10 @@ def resolve(conn, folder: str, name: str) -> tuple[Optional[int], list[str]]:
                 f"ambiguous: {name!r} is a name variation of "
                 f"{len(rows)} artists ({', '.join(r[1] for r in rows[:3])})"
             ]
+
+    hinted = _resolve_hinted(conn, table, name)
+    if hinted is not None:
+        return hinted
 
     bare = _strip_disamb(name)
     near = conn.execute(
