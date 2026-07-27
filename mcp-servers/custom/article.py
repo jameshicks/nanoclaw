@@ -889,6 +889,38 @@ def _reconnect_dropped(conn, vault: str, dropped: list[str], skip: str) -> dict:
 # ─── entry point ─────────────────────────────────────────────────────────
 
 
+# Headings this module and stubgen produce. Anything else on a page was
+# written by hand or by a trawler.
+_GENERATED_HEADINGS = {
+    "from discogs", "overview", "releases", "catalogue", "members", "labels",
+    "roster", "connections", "research queue", "stub — needs full research",
+}
+
+
+def _handwritten(text: str) -> Optional[str]:
+    """What on this page a regeneration would destroy, if anything.
+
+    The stub marker is not a reliable "safe to overwrite" signal: a trawler can
+    add prose, an annotated credits table and commentary to a page and leave
+    the marker in place, because nothing removes it. That is how a hand-written
+    Annie Anxiety Bandez page — paragraph, Key Credits table with a Notes
+    column, annotated Connections — was replaced by a generated one.
+    """
+    for m in _HEADING.finditer(text):
+        h = m.group(1).split("—")[0].strip().lower()
+        if h not in _GENERATED_HEADINGS and m.group(1).strip().lower() not in _GENERATED_HEADINGS:
+            return f"has a hand-written section: '{m.group(1).strip()}'"
+
+    # Prose above the first heading. The generator only ever puts a `**Key:**`
+    # meta block there.
+    head = text.split("\n## ", 1)[0]
+    for line in head.split("\n"):
+        s = line.strip()
+        if len(s) > 90 and not s.startswith(("#", "-", "|", ">", "*", "**", "---", "sources:")):
+            return f"has hand-written prose: {s[:60]!r}…"
+    return None
+
+
 def build(
     conn,
     vault: str,
@@ -898,10 +930,27 @@ def build(
     stub_links: bool = True,
     backlinks: bool = True,
     dry_run: bool = False,
+    force: bool = False,
 ) -> dict:
     folder, name = stubgen._split_target(target)
     if folder is None:
         return {"ok": False, "why": "expected 'Folder/Name'"}
+
+    _guard_path = os.path.join(vault, folder, name + ".md")
+    if not force and os.path.exists(_guard_path):
+        try:
+            why = _handwritten(open(_guard_path, encoding="utf-8").read())
+        except OSError:
+            why = None
+        if why:
+            return {
+                "ok": False,
+                "target": target,
+                "written": False,
+                "why": f"refusing to overwrite — page {why}. "
+                       "Use append_article_tables to add the generated sections "
+                       "without touching the prose, or pass force=true.",
+            }
 
     fx = facts(conn, folder, name)
     if not fx["resolved"]:

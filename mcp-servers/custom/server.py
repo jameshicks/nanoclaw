@@ -864,9 +864,15 @@ def build_article(
       skipped as too risky to auto-link.
 
     Returns counts, not content: `{ok, bytes, releases_listed, stubs:{...},
-    backlinks:{...}}`. Pass `dry_run=true` to preview without writing."""
+    backlinks:{...}}`. Pass `dry_run=true` to preview without writing.
+
+    **Refuses on a page containing hand-written prose or a hand-written
+    section**, returning `ok: false` and saying what it found. The stub marker
+    is not a safe-to-overwrite signal — a trawler can add prose and leave the
+    marker in place. Use `append_article_tables` to add the generated sections
+    without touching prose. `force=true` overrides, and destroys that prose."""
     return article.build(
-        _CONN, VAULT_PATH, target, overview, questions, stub_links, backlinks, dry_run
+        _CONN, VAULT_PATH, target, overview, questions, stub_links, backlinks, dry_run, force
     )
 
 
