@@ -451,7 +451,7 @@ def _in_longer_name(text: str, start: int, end: int) -> bool:
     after = text[end:]
     if after.startswith(" "):
         nxt = after[1:].split(" ")[0].split("\n")[0]
-        if nxt and _ADJACENT_CAP.fullmatch(nxt.rstrip(".,;:)")):
+        if nxt and _ADJACENT_CAP.fullmatch(nxt.rstrip(".,;:)\"'”’")):
             return True
     return False
 
