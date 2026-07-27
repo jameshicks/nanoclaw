@@ -162,6 +162,49 @@ targets.
 `discogs_dry: true` in the fact sheet means Discogs has nothing — `build_article`
 flags the page's frontmatter, leaves the stub marker, and stops.
 
+## Queue resolution (`queue_facts` + `queue_apply`)
+
+The Discogs resolution queue holds thousands of open questions, each carrying a
+`**File to update:**`. Because the entity is always named, answering a question
+never requires parsing it — which is what these two tools exploit.
+
+`queue_facts(target, questions)` returns one bundle per file group: identity,
+aliases, real name, full membership both ways, credited roles, styles, label
+affiliations with year spans, a ranked discography with per-release label and
+catalog number, and `open_questions` — the page's unchecked Research Queue
+labels, verbatim. Release titles the questions wrote as `*italics*` or
+`"quotes"`, and explicit `Discogs release 12345` ids, are matched against the
+entity's own discography and returned under `named_releases` with full credits.
+Titles it cannot place come back as `unmatched_titles`, never guessed at.
+
+It resolves the vault name to a Discogs id itself, so calling `search_artist`
+first is wasted — that lookup alone was 18 of 38 MCP calls in a measured run.
+It works on any entity, not just the group target, which covers "what solo work
+does this member have" without hand-written SQL.
+
+`queue_apply(target, answers)` writes the results back: `- [ ] label` becomes
+`- [x] label — answer`. Labels match **exactly**, against the strings
+`queue_facts` handed out; anything else is reported in `unmatched` rather than
+fuzzily matched, because a wrong match records an answer against the wrong
+question. Together they remove the Read-then-Edit loop over vault pages
+entirely — the agent never loads a page into context.
+
+Measured on live 20-item batches, holding output quality constant:
+
+| | turns | cache wr | $/run | $/item |
+|---|---:|---:|---:|---:|
+| subagent per question (5 items/run) | — | 186k | 2.031 | 0.406 |
+| inline, exploring with raw tools | 72 | 192k | 1.208 | 0.060 |
+| `queue_facts` | 59 | 165k | 1.157 | 0.058 |
+| `+ queue_apply` | 61 | 114k | 0.949 | 0.047 |
+| `+ per-release label, full lineup` | 47 | 56k | 0.737 | 0.037 |
+| `+ prompt fixes` | 32 | 35k | 0.469 | 0.023 |
+
+The counter-intuitive step is the second row: `queue_facts` cut turns and cache
+writes but *raised* cache reads, because front-loading every bundle means each
+later turn re-reads all of them. It only paid off once `queue_apply` removed the
+file Reads and the bundle covered enough to stop the SQL fallbacks.
+
 ## Build and run
 
 ```bash

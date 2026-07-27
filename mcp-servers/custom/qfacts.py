@@ -26,9 +26,20 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+import os
+
 import article
 import queries as Q
 import stubgen
+
+VAULT = os.environ.get("VAULT_PATH", "/vault")
+
+# `- [ ] Solo discography` — the open items in a page's Research Queue. The
+# resolve job used to Read whole vault pages just to find these lines (~10k
+# tokens a run across 14 files); returning them with the fact bundle removes
+# the Read entirely and lets `apply` match a label exactly instead of guessing.
+_OPEN_BOX = re.compile(r"^- \[ \] (.+?)\s*$", re.M)
+_DONE_BOX = re.compile(r"^- \[x\] ", re.M | re.I)
 
 # Caps. A queue answer needs enough discography to spot a label sequence or a
 # gap year, not a complete catalogue — that is what build_article is for.
@@ -129,14 +140,20 @@ def _discography(conn, artist_id: int, credit_count: int) -> tuple[list[dict], i
     rows.sort(key=lambda r: (article._first(r, "year", default=9999) or 9999, r.get("title") or ""))
     out = []
     for r in rows:
-        # `label` is deliberately omitted — the `labels` summary already carries
-        # label affiliations with year spans, and repeating it per row was 13%
-        # of an early bundle for no extra answering power.
         row = {
             "year": article._first(r, "year", "released_year"),
             "title": r.get("title"),
             "release_id": r.get("release_id") or r.get("id"),
         }
+        # Per-release label and catalog number. Dropping these to save 13% of
+        # the bundle was a false economy: the questions ask "which label put
+        # out X" constantly, and without them a run fell back to hand-written
+        # SQL 13 times, which costs far more than the rows do.
+        lbl = r.get("label") or r.get("label_name")
+        if lbl:
+            row["label"] = lbl
+        if r.get("catno"):
+            row["catno"] = r["catno"]
         role = r.get("role")
         if role:
             row["role"] = role
@@ -144,6 +161,28 @@ def _discography(conn, artist_id: int, credit_count: int) -> tuple[list[dict], i
             row["guest"] = True
         out.append(row)
     return out, total
+
+
+def _lineup(conn, artist_id: int) -> tuple[list[str], list[str]]:
+    """Full membership both ways. The shared stub helper caps these at 5, which
+    is fine for a stub header but sends lineup questions straight to SQL."""
+    members = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT member_name FROM group_member WHERE group_artist_id = ?"
+            " AND member_name IS NOT NULL ORDER BY member_name LIMIT 40",
+            [artist_id],
+        ).fetchall()
+    ]
+    member_of = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT a.name FROM group_member gm JOIN artist a ON a.id = gm.group_artist_id"
+            " WHERE gm.member_artist_id = ? ORDER BY a.name LIMIT 40",
+            [artist_id],
+        ).fetchall()
+    ]
+    return members, member_of
 
 
 def _aliases(conn, artist_id: int) -> list[str]:
@@ -202,22 +241,95 @@ def _named_releases(
     return out, unmatched
 
 
+def _vault_path(folder: str, name: str) -> str:
+    return os.path.join(VAULT, folder, name + ".md")
+
+
+def open_checkboxes(folder: str, name: str) -> list[str]:
+    """Unchecked Research Queue labels on a vault page, in file order."""
+    p = _vault_path(folder, name)
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as fh:
+            return _OPEN_BOX.findall(fh.read())
+    except OSError:
+        return []
+
+
+def apply(target: str, answers: list[dict]) -> dict[str, Any]:
+    """Write answers into a page's Research Queue: `- [ ] label` becomes
+    `- [x] label — answer`.
+
+    Labels are matched exactly, against the strings `queue_facts` handed out.
+    A label that no longer matches is reported, never fuzzily guessed at — a
+    wrong checkbox silently records an answer against the wrong question.
+    """
+    folder, name, warnings = split_target(target)
+    if folder is None:
+        return {"applied": 0, "warnings": warnings, "unmatched": [a.get("label") for a in answers]}
+
+    path = _vault_path(folder, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        return {"applied": 0, "warnings": warnings + [f"cannot read {path}: {e}"],
+                "unmatched": [a.get("label") for a in answers]}
+
+    original = text
+    applied, unmatched = 0, []
+    for a in answers:
+        label = (a.get("label") or "").strip()
+        ans = " ".join((a.get("answer") or "").split())
+        if not label or not ans:
+            unmatched.append(label or "(empty label)")
+            continue
+        old = f"- [ ] {label}"
+        if old not in text:
+            unmatched.append(label)
+            continue
+        text = text.replace(old, f"- [x] {label} — {ans}", 1)
+        applied += 1
+
+    if applied:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        stubgen._match_dir_owner(path)
+
+    return {
+        "applied": applied,
+        "unmatched": unmatched,
+        "still_open": len(_OPEN_BOX.findall(text)),
+        "warnings": warnings,
+        "changed": text != original,
+    }
+
+
 def facts(conn, target: str, questions: Optional[list[str]] = None) -> dict[str, Any]:
     """One call per file group: everything that group's questions could need."""
     folder, name, warnings = split_target(target)
     if folder is None:
         return {"resolved": False, "target": target, "warnings": warnings}
 
+    # Read once, whether or not Discogs resolves: an unresolvable entity still
+    # has checkboxes that need closing with "Discogs has nothing".
+    boxes = open_checkboxes(folder, name)
+
     entity_id, rw = stubgen.resolve(conn, folder, name)
     warnings = warnings + rw
     if entity_id is None:
-        return {"resolved": False, "target": target, "warnings": warnings}
+        return {
+            "resolved": False,
+            "target": f"{folder}/{name}",
+            "open_questions": boxes,
+            "warnings": warnings,
+        }
 
     titles, ids = extract_titles(questions or [])
     out: dict[str, Any] = {
         "resolved": True,
         "target": f"{folder}/{name}",
         "id": entity_id,
+        "open_questions": boxes,
         "warnings": warnings,
     }
 
@@ -256,6 +368,7 @@ def facts(conn, target: str, questions: Optional[list[str]] = None) -> dict[str,
         )
     else:
         f = stubgen._artist_facts(conn, entity_id)
+        members, member_of = _lineup(conn, entity_id)
         discog, total = _discography(conn, entity_id, f.get("credit_count") or 0)
         named, unmatched = _named_releases(conn, titles, ids, discog, entity_id)
         out.update(
@@ -264,8 +377,8 @@ def facts(conn, target: str, questions: Optional[list[str]] = None) -> dict[str,
                 "name": f["name"],
                 "realname": f.get("realname"),
                 "aliases": _aliases(conn, entity_id),
-                "members": f.get("members"),
-                "member_of": f.get("member_of"),
+                "members": members,
+                "member_of": member_of,
                 "roles": f.get("roles"),
                 "styles": f.get("styles"),
                 "years": f"{f.get('year_min')}–{f.get('year_max')}",

@@ -738,12 +738,35 @@ def queue_facts(target: str, questions: Optional[list[str]] = None) -> dict:
     credits. Titles it could not place come back in `unmatched_titles` — only
     then is `search_release` worth a call.
 
+    `open_questions` lists the page's unchecked Research Queue labels, verbatim.
+    Do NOT Read the vault file — these are the only lines you need from it, and
+    they are the exact strings `queue_apply` matches on.
+
     `discography_truncated: true` means the ranked selection was capped; the
     full count is in `total_releases`. `discogs_dry: true` means Discogs has
     nothing for this entity — answer the group's items saying so and move on.
     `resolved: false` means the vault name has no exact Discogs match; report
     the candidate spellings in `warnings` rather than guessing."""
     return qfacts.facts(_CONN, target, questions)
+
+
+@mcp.tool
+@_log_call
+def queue_apply(target: str, answers: list[dict]) -> dict:
+    """Write answers into a vault page's Research Queue, turning
+    `- [ ] label` into `- [x] label — answer`.
+
+    `answers` is `[{"label": "<exact string from queue_facts open_questions>",
+    "answer": "<one or two sentences>"}, ...]`. Use this instead of Read +
+    Edit: it needs no file content in your context and cannot corrupt the rest
+    of the page.
+
+    Labels match exactly. Anything that does not match comes back in
+    `unmatched` rather than being fuzzily guessed at, because a wrong match
+    records an answer against the wrong question. If a label is unmatched,
+    re-check it against `open_questions` — do not fall back to Edit unless it
+    is genuinely absent."""
+    return qfacts.apply(target, answers)
 
 
 @mcp.tool
