@@ -337,6 +337,25 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
     if overview:
         L += ["## Overview", "", overview.strip(), ""]
 
+    for _, block in _data_blocks(conn, fx, rows, index):
+        L += block
+
+    all_q = list(questions or []) + [f"{g} — verify off-Discogs" for g in fx.get("gaps") or []]
+    if all_q:
+        L += ["## Research Queue", ""] + [f"- [ ] {q}" for q in all_q] + [""]
+
+    return "\n".join(L).rstrip() + "\n"
+
+
+def _data_blocks(conn, fx: dict, rows: list[dict], index: dict) -> list[tuple[str, list[str]]]:
+    """The query-generated sections, as (section name, lines) pairs.
+
+    Shared by `render` (whole page) and `append_tables` (graft onto an existing
+    article). Kept as one implementation so a page gains the same tables
+    whichever way it was produced.
+    """
+    out: list[tuple[str, list[str]]] = []
+
     label = "Catalogue" if fx["kind"] == "label" else "Releases"
     table = _release_table(rows, fx["kind"])
     if table:
@@ -346,23 +365,23 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
             if (fx.get("total_credits") or 0) > fx["selected_releases"]
             else ""
         )
-        L += [f"## {label}{note}", "", *table, ""]
+        out.append((label, [f"## {label}{note}", "", *table, ""]))
 
     if fx.get("members"):
-        L += ["## Members", ""] + [
+        out.append(("Members", ["## Members", ""] + [
             f"- {stubgen._link(conn, m, 'person', index)}" for m in fx["members"]
-        ] + [""]
+        ] + [""]))
 
     if fx.get("labels"):
-        L += ["## Labels", "", "| Label | Works | Years |", "|---|---|---|"] + [
+        out.append(("Labels", ["## Labels", "", "| Label | Works | Years |", "|---|---|---|"] + [
             f"| {stubgen._link(conn, l['name'], 'label', index)} | {l['works']} | {l['years']} |"
             for l in fx["labels"]
-        ] + [""]
+        ] + [""]))
 
     if fx.get("roster"):
-        L += ["## Roster", ""] + [
+        out.append(("Roster", ["## Roster", ""] + [
             f"- {stubgen._link(conn, a, 'person', index)}" for a in fx["roster"]
-        ] + [""]
+        ] + [""]))
 
     conns = []
     if fx.get("parent"):
@@ -388,13 +407,172 @@ def render(conn, fx: dict, rows: list[dict], overview: str, questions: list[str]
             )
 
     if conns:
-        L += ["## Connections", "", *conns, ""]
+        out.append(("Connections", ["## Connections", "", *conns, ""]))
 
-    all_q = list(questions or []) + [f"{g} — verify off-Discogs" for g in fx.get("gaps") or []]
-    if all_q:
-        L += ["## Research Queue", ""] + [f"- [ ] {q}" for q in all_q] + [""]
+    return out
 
-    return "\n".join(L).rstrip() + "\n"
+
+_HEADING = re.compile(r"^#{2,3}\s+([^\n]+?)\s*$", re.M)
+_RQ_HEADING = re.compile(r"^#{2,3}\s+Research Queue\s*$", re.M)
+_TABLE_ROW = re.compile(r"^\|", re.M)
+_BOX = re.compile(r"^- \[ \] ([^\n]+?)[ \t]*$", re.M)
+
+# Bare generic asks, and the section that answers each. Only a *bare* item
+# qualifies — "Discogs ID — note: there is also an Australian band called Noise
+# Addict, confirm which this is" is a real question that merely starts with the
+# words.
+_ANSWERED_BY = (
+    (re.compile(r"^(full|complete|entire)\s+(discograph\w*|catalog\w*)$", re.I), ("Releases", "Catalogue")),
+    (re.compile(r"^(full|complete)\s+(roster)$", re.I), ("Roster",)),
+    (re.compile(r"^(full|complete)\s+(line-?up|membership|members)$", re.I), ("Members",)),
+)
+
+
+def _retire_answered(text: str, added: set[str]) -> tuple[str, int]:
+    """Close Research Queue items the sections just added now answer.
+
+    These are the items the vault sweep deliberately left alone on finished
+    articles, because nothing was going to answer them. Now something has.
+    """
+    n = 0
+
+    def repl(m):
+        nonlocal n
+        label = m.group(1).strip()
+        for pat, sections in _ANSWERED_BY:
+            if pat.match(label) and added.intersection(sections):
+                n += 1
+                return "<!-- removed: answered by the generated table above -->"
+        return m.group(0)
+
+    return _BOX.sub(repl, text), n
+
+
+def append_tables(
+    conn,
+    vault: str,
+    target: str,
+    stub_links: bool = True,
+    backlinks: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """Graft the query-generated sections onto an article, leaving prose alone.
+
+    133 finished articles ask for a discography they will never get: the
+    build-out job only selects stubs, and `build` rewrites the whole page, so
+    running it over trawler-written prose destroys the one thing a query cannot
+    reproduce. This adds only the sections the page is missing.
+
+    It splices — the existing text is never rewritten, only pushed apart — so
+    prose cannot be lost even if the section detection is wrong.
+    """
+    folder, name = stubgen._split_target(target)
+    if folder is None:
+        return {"ok": False, "why": "expected 'Folder/Name'"}
+
+    path = os.path.join(vault, folder, name + ".md")
+    if not os.path.exists(path):
+        return {"ok": False, "why": "page does not exist — use build_article", "target": target}
+
+    text = open(path, encoding="utf-8").read()
+    if "## Stub — needs full research" in text:
+        return {
+            "ok": False,
+            "why": "page is a stub — use build_article, which writes the whole page",
+            "target": target,
+        }
+
+    fx = facts(conn, folder, name)
+    if not fx["resolved"]:
+        return {"ok": False, "why": "; ".join(fx["warnings"]), "target": target}
+    if fx["discogs_dry"]:
+        return {"ok": True, "discogs_dry": True, "target": target, "added": [], "written": False}
+
+    index = stubgen.read_index(vault)
+    rows = (
+        _label_releases(conn, fx["id"], fx["total_credits"] or 0)
+        if folder == "Labels"
+        else _artist_releases(conn, fx["id"], fx["total_credits"] or 0)
+    )
+
+    # Skip anything the page already has. Headings are matched on their stem so
+    # a generated "## Releases — 40 most-pressed of ..." still counts as present.
+    present = {m.group(1).split("—")[0].strip().lower() for m in _HEADING.finditer(text)}
+    has_table = len(_TABLE_ROW.findall(text)) > 3
+
+    blocks, skipped = [], []
+    for nm, lines in _data_blocks(conn, fx, rows, index):
+        is_release = nm in ("Releases", "Catalogue")
+        if nm.lower() in present or (is_release and has_table):
+            skipped.append(nm)
+            continue
+        blocks.append((nm, lines))
+
+    if not blocks:
+        return {
+            "ok": True, "target": target, "written": False,
+            "added": [], "skipped_present": skipped,
+            "why": "page already has every generated section",
+        }
+
+    insert = "\n".join(l for _, lines in blocks for l in lines).rstrip() + "\n"
+
+    # Land above the Research Queue so the page reads data-then-open-questions,
+    # matching a generated article.
+    m = _RQ_HEADING.search(text)
+    if m:
+        pos, block = m.start(), insert + "\n"
+    else:
+        pos = len(text)
+        block = ("" if text.endswith("\n") else "\n") + "\n" + insert
+    new = text[:pos] + block + text[pos:]
+
+    # Splice invariant: cutting the inserted block back out must return the
+    # original byte for byte. True by construction, checked anyway so "prose is
+    # never lost" stays verifiable if this is ever edited.
+    if new[:pos] + new[pos + len(block) :] != text:
+        return {"ok": False, "why": "internal: splice would alter existing text", "target": target}
+
+    new, retired = _retire_answered(new, {nm for nm, _ in blocks})
+
+    if not dry_run:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(new)
+        stubgen._match_dir_owner(path)
+
+    result = {
+        "ok": True,
+        "target": target,
+        "written": not dry_run,
+        "added": [nm for nm, _ in blocks],
+        "skipped_present": skipped,
+        "releases_listed": len(rows) if any(nm in ("Releases", "Catalogue") for nm, _ in blocks) else 0,
+        "bytes_added": len(insert),
+        "queue_items_retired": retired,
+    }
+
+    if stub_links:
+        linked = sorted(set(stubgen._LINK.findall(insert)))
+        missing = [
+            t for t in linked
+            if stubgen._split_target(t)[0] and not os.path.exists(os.path.join(vault, t + ".md"))
+        ]
+        worthy = [t for t in missing if _stub_worthy(conn, t, fx["id"])]
+        result["stubs"] = stubgen.write_stubs(conn, vault, worthy, dry_run=dry_run)
+        result["stubs"]["gated_out"] = len(missing) - len(worthy)
+
+    if backlinks and not dry_run:
+        associates = (
+            list(fx.get("members") or [])
+            + list(fx.get("member_of") or [])
+            + list(fx.get("roster") or [])
+            + [c["name"] for c in fx.get("collaborators") or []]
+            + [l["name"] for l in fx.get("labels") or []]
+            + ([fx["parent"]] if fx.get("parent") else [])
+        )
+        result["backlinks"] = repair_backlinks(vault, folder, name, skip=path, associates=associates)
+
+    return result
 
 
 # ─── back-link repair ────────────────────────────────────────────────────

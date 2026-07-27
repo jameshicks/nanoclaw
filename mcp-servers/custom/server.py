@@ -765,6 +765,30 @@ def queue_facts(target: str, questions: Optional[list[str]] = None) -> dict:
 
 @mcp.tool
 @_log_call
+def append_article_tables(
+    target: str, stub_links: bool = True, backlinks: bool = True, dry_run: bool = False
+) -> dict:
+    """Add the query-generated sections — release table, members, labels,
+    roster, connections — to an EXISTING article, without touching its prose.
+
+    Use this, never `build_article`, when a finished page is missing its
+    discography. `build_article` rewrites the whole page and would destroy
+    trawler-written prose, which no query can reproduce.
+
+    Only sections the page lacks are added; anything already there is reported
+    in `skipped_present`. The new block lands above `## Research Queue`. It
+    splices rather than rewrites, and verifies the original text is unchanged
+    before saving.
+
+    Refuses on a stub (use `build_article` — it writes the whole page) and on a
+    page that doesn't exist. `dry_run: true` reports what it would add.
+    Returns `{ok, added, skipped_present, releases_listed, bytes_added, stubs,
+    backlinks}`."""
+    return article.append_tables(_CONN, VAULT_PATH, target, stub_links, backlinks, dry_run)
+
+
+@mcp.tool
+@_log_call
 def vault_open_questions(target: str) -> dict:
     """The unchecked Research Queue labels on a vault page (`Folder/Name`),
     verbatim, plus how many are already answered.
