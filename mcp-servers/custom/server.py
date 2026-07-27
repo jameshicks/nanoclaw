@@ -1,4 +1,4 @@
-"""Discogs DuckDB MCP server. Exposes 19 tools over FastMCP HTTP on port 8765.
+"""Discogs DuckDB MCP server. Exposes 25 tools over FastMCP HTTP on port 8765.
 
 Expects a read-only DuckDB file at /data/discogs.duckdb (override with DISCOGS_DB_PATH)
 with FTS indexes already built via setup_fts.py. Fails fast at import if either is missing.
@@ -18,6 +18,7 @@ import duckdb
 from fastmcp import FastMCP
 
 import article
+import qfacts
 import queries as Q
 import sql_guard
 import stubgen
@@ -715,6 +716,34 @@ def article_facts(target: str) -> dict:
     if folder is None:
         return {"resolved": False, "warnings": ["expected 'Folder/Name'"]}
     return article.facts(_CONN, folder, name)
+
+
+@mcp.tool
+@_log_call
+def queue_facts(target: str, questions: Optional[list[str]] = None) -> dict:
+    """Everything needed to answer one `## file:` group from the Discogs
+    resolution queue, in a single call. Pass the group's `File to update`
+    target (`Folder/Name`) and the list of its question strings.
+
+    Call this ONCE PER GROUP instead of searching. It resolves the name to a
+    Discogs id for you — do not call `search_artist` first, that lookup is the
+    single most repeated wasted call in this job. Returns identity, aliases,
+    real name, members/member_of, credited roles, styles, active years, label
+    affiliations with year spans and work counts, a ranked discography, and
+    total counts.
+
+    Release titles written in the questions as `*italics*` or `"quotes"`, and
+    explicit `Discogs release 12345` ids, are matched against this entity's own
+    discography and returned under `named_releases` with full per-release
+    credits. Titles it could not place come back in `unmatched_titles` — only
+    then is `search_release` worth a call.
+
+    `discography_truncated: true` means the ranked selection was capped; the
+    full count is in `total_releases`. `discogs_dry: true` means Discogs has
+    nothing for this entity — answer the group's items saying so and move on.
+    `resolved: false` means the vault name has no exact Discogs match; report
+    the candidate spellings in `warnings` rather than guessing."""
+    return qfacts.facts(_CONN, target, questions)
 
 
 @mcp.tool
