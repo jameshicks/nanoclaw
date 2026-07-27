@@ -276,32 +276,69 @@ def apply(target: str, answers: list[dict]) -> dict[str, Any]:
                 "unmatched": [a.get("label") for a in answers]}
 
     original = text
-    applied, unmatched = 0, []
+    applied, appended, unmatched = 0, 0, []
+    to_append: list[str] = []
     for a in answers:
         label = (a.get("label") or "").strip()
+        topic = (a.get("topic") or "").strip()
         ans = " ".join((a.get("answer") or "").split())
-        if not label or not ans:
-            unmatched.append(label or "(empty label)")
+        if not ans:
+            unmatched.append(label or topic or "(empty answer)")
             continue
         old = f"- [ ] {label}"
-        if old not in text:
-            unmatched.append(label)
+        if label and old in text:
+            text = text.replace(old, f"- [x] {label} — {ans}", 1)
+            applied += 1
             continue
-        text = text.replace(old, f"- [x] {label} — {ans}", 1)
-        applied += 1
+        # No matching checkbox. A finding that reached this page is worth
+        # recording anyway — dropping it was silently losing most of what the
+        # Wikipedia job answered, since a queue question often has no
+        # corresponding line on the page it names.
+        if topic:
+            to_append.append(f"- [x] {topic} — {ans}")
+            appended += 1
+        else:
+            unmatched.append(label or "(no label or topic)")
 
-    if applied:
+    if to_append:
+        text = _append_to_queue(text, to_append)
+
+    if applied or appended:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         stubgen._match_dir_owner(path)
 
     return {
         "applied": applied,
+        "appended": appended,
         "unmatched": unmatched,
         "still_open": len(_OPEN_BOX.findall(text)),
         "warnings": warnings,
         "changed": text != original,
     }
+
+
+_RQ_HEADING = re.compile(r"^(#{2,3}\s*Research Queue\s*)$", re.M | re.I)
+
+
+def _append_to_queue(text: str, lines: list[str]) -> str:
+    """Add checked items to the page's Research Queue, creating it if absent.
+
+    Inserted after the section's existing list so the open items a human scans
+    for stay at the top of what they were already reading.
+    """
+    m = _RQ_HEADING.search(text)
+    block = "\n".join(lines)
+    if not m:
+        sep = "" if text.endswith("\n") else "\n"
+        return f"{text}{sep}\n## Research Queue\n\n{block}\n"
+
+    start = m.end()
+    rest = text[start:]
+    nxt = re.search(r"^#{1,3} ", rest, re.M)
+    end = start + (nxt.start() if nxt else len(rest))
+    section = text[start:end]
+    return text[:start] + section.rstrip("\n") + "\n" + block + "\n\n" + text[end:]
 
 
 def facts(conn, target: str, questions: Optional[list[str]] = None) -> dict[str, Any]:

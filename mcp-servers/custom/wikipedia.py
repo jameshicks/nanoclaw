@@ -97,6 +97,89 @@ def _clean_html(html: str, max_chars: Optional[int]) -> str:
     return text
 
 
+# Sections that never answer a research question. Discography/Awards are kept
+# deliberately — they carry dates and titles.
+_BOILERPLATE = re.compile(
+    r"^(references|external links|see also|notes|citations|sources|"
+    r"further reading|bibliography|footnotes|general references)\b",
+    re.I,
+)
+_SEC = "\x00SEC\x00"
+_STOP = set(
+    "what is are the a an of on in for do does did any which who whom how and or to with by "
+    "across when where why was were has have had this that his her their its from at about".split()
+)
+
+
+def _split_sections(html: str) -> list[tuple[str, str]]:
+    """[(heading, text)] with the lead under heading ''.
+
+    `get_text` flattens headings into indistinguishable lines, so they are
+    replaced with a sentinel first — otherwise there is no way to tell an
+    article's structure from its prose, and truncation can only chop the front.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    for node in soup.select(_DROP_SELECTORS):
+        node.decompose()
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        h.replace_with(soup.new_string(f"\n{_SEC}{h.get_text(' ', strip=True)}\n"))
+    body = soup.find("body") or soup
+    text = re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", body.get_text("\n"))).strip()
+
+    out: list[tuple[str, str]] = []
+    parts = text.split(_SEC)
+    out.append(("", parts[0].strip()))
+    for p in parts[1:]:
+        head, _, rest = p.partition("\n")
+        out.append((head.strip(), rest.strip()))
+    return [(h, t) for h, t in out if t and not _BOILERPLATE.match(h)]
+
+
+def _relevant(html: str, query: str, max_chars: int) -> tuple[str, list[str], list[str]]:
+    """Lead plus the sections that match `query`, within a char budget.
+
+    A question usually needs one section of a long article; the mean article in
+    this snapshot is ~9.7k tokens and U2 is 40k. Returning the whole thing and
+    truncating from the front pays for the entire prefix to reach a fact that
+    may sit two thirds down.
+    """
+    sections = _split_sections(html)
+    if not sections:
+        return "", [], []
+    terms = {w for w in re.findall(r"[a-z0-9']+", query.lower()) if w not in _STOP and len(w) > 2}
+
+    lead_h, lead_t = sections[0] if sections[0][0] == "" else ("", "")
+    rest = sections[1:] if sections[0][0] == "" else sections
+
+    def score(h: str, t: str) -> float:
+        ht = {w for w in re.findall(r"[a-z0-9']+", h.lower()) if w not in _STOP}
+        body = t.lower()
+        # A heading hit is worth much more than a body mention.
+        return 3.0 * len(terms & ht) + sum(1 for w in terms if w in body) / max(1, len(terms))
+
+    ranked = sorted(rest, key=lambda s: -score(*s))
+    chunks: list[str] = []
+    included: list[str] = []
+    budget = max_chars
+    if lead_t:
+        chunks.append(lead_t[:budget])
+        budget -= len(chunks[0])
+        included.append("(lead)")
+    for h, t in ranked:
+        if budget < 400:
+            break
+        if score(h, t) <= 0:
+            continue
+        body = t if len(t) <= budget else t[:budget].rsplit("\n", 1)[0] + " …"
+        chunks.append(f"== {h} ==\n{body}")
+        budget -= len(body) + len(h) + 6
+        included.append(h)
+    omitted = [h for h, _ in rest if h not in included]
+    return "\n\n".join(chunks), included, omitted
+
+
 def _entry_html(entry) -> str:
     item = entry.get_item()
     return bytes(item.content).decode("utf-8", "replace")
@@ -180,9 +263,12 @@ def _suggest(archive, pattern: str, limit: int) -> Optional[list[dict]]:
         return None
 
 
-def get_article(title: str, max_chars: int = 40000) -> dict:
+def get_article(title: str, max_chars: int = 40000, query: Optional[str] = None) -> dict:
     """Fetch one article as clean text. Resolves redirects. On a miss, returns
-    `{found: False, suggestions: [...]}` from a title/full-text search."""
+    `{found: False, suggestions: [...]}` from a title/full-text search.
+
+    With `query`, returns the lead plus only the sections that match it, and
+    reports which sections were included and which were left out."""
     archive, err = _get()
     if err:
         return {"error": err}
@@ -217,8 +303,17 @@ def get_article(title: str, max_chars: int = 40000) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"error": f"failed to read article: {e!r}", "title": entry.title}
 
-    text = _clean_html(html, max_chars)
+    extra: dict = {}
+    if query:
+        text, included, omitted = _relevant(html, query, max_chars)
+        if not text:  # no section scored; fall back rather than return nothing
+            text = _clean_html(html, max_chars)
+        else:
+            extra = {"sections_included": included, "sections_omitted": omitted}
+    else:
+        text = _clean_html(html, max_chars)
     return {
+        **extra,
         "found": True,
         "title": entry.title,
         "path": entry.path,

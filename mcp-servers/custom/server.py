@@ -653,15 +653,28 @@ def search_wikipedia(query: str, limit: int = 10) -> dict:
 
 @mcp.tool
 @_log_call
-def get_wikipedia_article(title: str, max_chars: int = 40000) -> dict:
+def get_wikipedia_article(
+    title: str, max_chars: int = 40000, query: Optional[str] = None
+) -> dict:
     """Fetch a single OFFLINE Wikipedia article as clean plain text (chrome,
     references, and navboxes stripped; infobox facts kept). Resolves redirects
     automatically. On an exact-title miss, returns
     `{found: False, suggestions:[...]}` so you can retry with a better title —
     or call `search_wikipedia` first and pass a result's `title`/`path` here.
-    `max_chars` (default 40000) truncates very long articles; clamped to
-    [500, 200000]. Local June-2026 snapshot, not the live web."""
-    return W.get_article(title, max_chars)
+    Local June-2026 snapshot, not the live web.
+
+    **Pass `query` whenever you are after a specific fact** — give it the
+    question you are trying to answer. You get the lead plus only the sections
+    that match, with `sections_included` and `sections_omitted` telling you what
+    you did and didn't see (ask again with a different `query` to get an omitted
+    one). Articles here average ~9.7k tokens and run to 40k; targeted retrieval
+    typically returns ~90% less. Without `query` the whole article is truncated
+    from the front, which pays for the entire prefix to reach a fact two thirds
+    down.
+
+    `max_chars` caps the returned text (default 40000, clamped to
+    [500, 200000]); with `query`, 4000–6000 is usually plenty."""
+    return W.get_article(title, max_chars, query)
 
 
 VAULT_PATH = os.environ.get("VAULT_PATH", "/vault")
@@ -752,20 +765,49 @@ def queue_facts(target: str, questions: Optional[list[str]] = None) -> dict:
 
 @mcp.tool
 @_log_call
+def vault_open_questions(target: str) -> dict:
+    """The unchecked Research Queue labels on a vault page (`Folder/Name`),
+    verbatim, plus how many are already answered.
+
+    Use this instead of Glob + Read when all you need is to find which item to
+    answer — it returns the handful of lines that matter rather than the whole
+    page, and the strings come back in the exact form `queue_apply` matches on.
+    Pair it with `queue_apply` to record answers without ever loading the page
+    into context."""
+    folder, name, warnings = qfacts.split_target(target)
+    if folder is None:
+        return {"found": False, "warnings": warnings}
+    return {
+        "found": True,
+        "target": f"{folder}/{name}",
+        "open_questions": qfacts.open_checkboxes(folder, name),
+        "warnings": warnings,
+    }
+
+
+@mcp.tool
+@_log_call
 def queue_apply(target: str, answers: list[dict]) -> dict:
     """Write answers into a vault page's Research Queue, turning
     `- [ ] label` into `- [x] label — answer`.
 
-    `answers` is `[{"label": "<exact string from queue_facts open_questions>",
-    "answer": "<one or two sentences>"}, ...]`. Use this instead of Read +
-    Edit: it needs no file content in your context and cannot corrupt the rest
-    of the page.
+    `answers` is a list of `{"label": ..., "topic": ..., "answer": ...}`:
 
-    Labels match exactly. Anything that does not match comes back in
-    `unmatched` rather than being fuzzily guessed at, because a wrong match
-    records an answer against the wrong question. If a label is unmatched,
-    re-check it against `open_questions` — do not fall back to Edit unless it
-    is genuinely absent."""
+    - `label` — an **exact** string from `open_questions`. Matching is exact,
+      never fuzzy, because a wrong match records an answer against the wrong
+      question. Flips that line to `- [x] label — answer`.
+    - `topic` — a short title (3–6 words) used when there is no matching
+      checkbox. The finding is appended as a new `- [x] topic — answer`,
+      creating a Research Queue section if the page has none.
+
+    Give **both** whenever you have a plausible label: it flips the existing
+    line if the label matches and appends under `topic` if it doesn't, so a
+    finding is never silently dropped. An answer with neither a matching label
+    nor a topic comes back in `unmatched` and is not written.
+
+    Use this instead of Read + Edit: it needs no file content in your context
+    and cannot corrupt the rest of the page. Returns
+    `{applied, appended, unmatched, still_open, changed}`."""
     return qfacts.apply(target, answers)
 
 
