@@ -31,6 +31,36 @@ _DISAMB = re.compile(r"\s*\(\d+\)$")
 _ROLE_ANNOT = re.compile(r"\[[^\]]*\]")
 
 
+# Characters a Discogs name may contain that a filename may not. A slash is the
+# dangerous one: "CBS/Sony" written straight through becomes Labels/CBS/Sony.md,
+# which silently creates a phantom "CBS" folder and a page called Sony. Roughly
+# 12.6k artist and 12.6k label names contain one.
+_UNSAFE = {"/": "-", "\\": "-", ":": " -", "*": "", "?": "", '"': "-", "<": "(", ">": ")", "|": "-"}
+
+
+def sanitize(name: str) -> str:
+    """Discogs name → vault filename, matching the convention already in use
+    (AC/DC → AC-DC, Kenny "Dope" Gonzalez → Kenny -Dope- Gonzalez)."""
+    out = name
+    for bad, good in _UNSAFE.items():
+        out = out.replace(bad, good)
+    return re.sub(r"\s{2,}", " ", out).strip(" .")
+
+
+def unsanitize_candidates(filename: str) -> list[str]:
+    """Filename → the Discogs names that could have produced it.
+
+    Sanitising is lossy — a hyphen in a filename may be a real hyphen, a slash
+    or a quote — so resolution tries the candidates rather than guessing.
+    """
+    out = [filename]
+    if "-" in filename:
+        out.append(filename.replace(" - ", "/"))
+        out.append(filename.replace("-", "/"))
+        out.append(re.sub(r"(?<= )-([^-\s][^-]*?)-(?= )", r'"\1"', filename))
+    return list(dict.fromkeys(c for c in out if c))
+
+
 def _strip_disamb(name: str) -> str:
     return _DISAMB.sub("", name)
 
@@ -207,11 +237,12 @@ def resolve(conn, folder: str, name: str) -> tuple[Optional[int], list[str]]:
     """Map a vault page to a Discogs id. Exact match only — a wrong id is worse
     than an unresolved stub, so near-misses are reported, never guessed."""
     table = "label" if folder == "Labels" else "artist"
-    rows = conn.execute(f"SELECT id FROM {table} WHERE name = ?", [name]).fetchall()
-    if len(rows) == 1:
-        return rows[0][0], []
-    if len(rows) > 1:
-        return None, [f"ambiguous: {len(rows)} {table} rows named {name!r}"]
+    for cand in unsanitize_candidates(name):
+        rows = conn.execute(f"SELECT id FROM {table} WHERE name = ?", [cand]).fetchall()
+        if len(rows) == 1:
+            return rows[0][0], ([] if cand == name else [f"matched Discogs name {cand!r}"])
+        if len(rows) > 1:
+            return None, [f"ambiguous: {len(rows)} {table} rows named {cand!r}"]
 
     bare = _strip_disamb(name)
     near = conn.execute(
@@ -233,6 +264,12 @@ def _in_index(name: str, index: dict[str, set]) -> Optional[str]:
     return None
 
 
+def _wiki(folder: str, real: str) -> str:
+    """A link whose target is a legal filename but which reads as the real name."""
+    safe = sanitize(real)
+    return f"[[{folder}/{safe}]]" if safe == real else f"[[{folder}/{safe}|{real}]]"
+
+
 def _link(conn, name: str, kind: str, index: dict[str, set]) -> str:
     """Wiki-link pointing at the page the vault actually has.
 
@@ -241,9 +278,9 @@ def _link(conn, name: str, kind: str, index: dict[str, set]) -> str:
     the Discogs spelling manufactures a dead link for vault-maintenance to find
     later, so try the entity's aliases against the index before giving up.
     """
-    folder = _in_index(name, index)
+    folder = _in_index(name, index) or _in_index(sanitize(name), index)
     if folder:
-        return f"[[{folder}/{name}]]"
+        return _wiki(folder, name)
 
     if kind != "label":
         aliases = conn.execute(
@@ -259,9 +296,9 @@ def _link(conn, name: str, kind: str, index: dict[str, set]) -> str:
             [name, name],
         ).fetchall()
         for (alias,) in aliases:
-            folder = _in_index(alias, index)
+            folder = _in_index(alias, index) or _in_index(sanitize(alias), index)
             if folder:
-                return f"[[{folder}/{alias}|{name}]]"
+                return f"[[{folder}/{sanitize(alias)}|{name}]]"
 
     # No page yet, so the folder we pick here is where a future stub gets filed.
     # The caller's `kind` is only a hint — a label's roster entry is passed as
@@ -282,7 +319,7 @@ def _link(conn, name: str, kind: str, index: dict[str, set]) -> str:
         ).fetchone()
         if row and row[0]:
             default = "Bands"
-    return f"[[{default}/{name}]]"
+    return _wiki(default, name)
 
 
 def _gaps(f: dict[str, Any]) -> list[str]:
@@ -435,7 +472,7 @@ def write_stubs(conn, vault: str, targets: list[str], dry_run: bool = False) -> 
             unresolved.append({"target": target, "why": "expected 'Folder/Name'"})
             continue
 
-        path = os.path.join(vault, folder, name + ".md")
+        path = os.path.join(vault, folder, sanitize(name) + ".md")
         if os.path.exists(path):
             skipped.append(target)
             continue
