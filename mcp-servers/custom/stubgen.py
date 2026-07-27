@@ -61,6 +61,47 @@ def unsanitize_candidates(filename: str) -> list[str]:
     return list(dict.fromkeys(c for c in out if c))
 
 
+# Ways a vault page name drifts from the Discogs name without meaning anything
+# different. Each was a page that resolved to nothing:
+#   Pepsi &amp; Shirlie       an HTML entity written into the filename
+#   Siouxsie And The Banshees Discogs writes "&"
+#   Sisters of Mercy          Discogs writes "The Sisters Of Mercy"
+#   Wax Trax!                 Discogs writes "Wax Trax! Records"
+_ENTITIES = (("&amp;", "&"), ("&#38;", "&"), ("&quot;", '"'), ("&apos;", "'"), ("&nbsp;", " "))
+_LABEL_SUFFIXES = (" Records", " Recordings", " Record Co.", " Music", " Ltd.", ", Inc.")
+
+
+def _variants(name: str, is_label: bool) -> list[str]:
+    """Spellings to try after the exact name fails. Order is widest-first only
+    in the sense of cheapness; every one is still required to match exactly one
+    row, so a variant can never silently pick the wrong entity."""
+    seed = {name}
+    for ent, ch in _ENTITIES:
+        if ent in name:
+            seed.add(name.replace(ent, ch))
+
+    out: list[str] = []
+    for base in seed:
+        out.append(base)
+        # "And" ↔ "&", both directions.
+        if re.search(r"\band\b", base, re.I):
+            out.append(re.sub(r"\s+\band\b\s+", " & ", base, flags=re.I))
+        if "&" in base:
+            out.append(re.sub(r"\s*&\s*", " And ", base))
+            out.append(re.sub(r"\s*&\s*", " and ", base))
+        # A leading article the vault dropped, or added.
+        if not re.match(r"^the\s", base, re.I):
+            out.append("The " + base)
+        else:
+            out.append(re.sub(r"^the\s+", "", base, flags=re.I))
+        # Labels are routinely filed without their corporate suffix.
+        if is_label:
+            for suf in _LABEL_SUFFIXES:
+                if not base.endswith(suf):
+                    out.append(base + suf)
+    return [c for c in dict.fromkeys(out) if c and c != name]
+
+
 def _strip_disamb(name: str) -> str:
     return _DISAMB.sub("", name)
 
@@ -243,6 +284,18 @@ def resolve(conn, folder: str, name: str) -> tuple[Optional[int], list[str]]:
             return rows[0][0], ([] if cand == name else [f"matched Discogs name {cand!r}"])
         if len(rows) > 1:
             return None, [f"ambiguous: {len(rows)} {table} rows named {cand!r}"]
+
+    # Case-insensitive, then the spelling variants. Still exact-match semantics:
+    # a candidate is accepted only when it hits exactly one row, so "The
+    # Sisters Of Mercy" resolves while anything genuinely ambiguous does not.
+    for cand in [name] + _variants(name, table == "label"):
+        rows = conn.execute(
+            f"SELECT id, name FROM {table} WHERE lower(name) = lower(?)", [cand]
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0][0], [f"matched Discogs name {rows[0][1]!r}"]
+        if len(rows) > 1:
+            return None, [f"ambiguous: {len(rows)} {table} rows matching {cand!r}"]
 
     bare = _strip_disamb(name)
     near = conn.execute(
