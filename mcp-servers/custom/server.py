@@ -780,10 +780,13 @@ def append_article_tables(
     splices rather than rewrites, and verifies the original text is unchanged
     before saving.
 
-    Refuses on a stub (use `build_article` — it writes the whole page) and on a
-    page that doesn't exist. `dry_run: true` reports what it would add.
-    Returns `{ok, added, skipped_present, releases_listed, bytes_added, stubs,
-    backlinks}`."""
+    Refuses on a bare stub (use `build_article` — it writes the whole page) and
+    on a page that doesn't exist. A stub marker on a page that also has prose is
+    treated as stale: the marker is stripped and the tables grafted, since
+    `build_article` refuses on that prose and the page would otherwise be
+    unbuildable by either tool. `dry_run: true` reports what it would add.
+    Returns `{ok, added, skipped_present, releases_listed, bytes_added,
+    stub_marker_stripped, stubs, backlinks}`."""
     return article.append_tables(_CONN, VAULT_PATH, target, stub_links, backlinks, dry_run)
 
 

@@ -465,6 +465,11 @@ def append_tables(
 
     It splices — the existing text is never rewritten, only pushed apart — so
     prose cannot be lost even if the section detection is wrong.
+
+    A stub marker on a page that also has prose is stale, not a signal to
+    refuse: `build` will not touch such a page either, and refusing here left
+    80% of stub-marked pages unbuildable by any tool. Those get the marker
+    stripped and the tables grafted. A genuinely bare stub still goes to `build`.
     """
     folder, name = stubgen._split_target(target)
     if folder is None:
@@ -475,12 +480,25 @@ def append_tables(
         return {"ok": False, "why": "page does not exist — use build_article", "target": target}
 
     text = open(path, encoding="utf-8").read()
-    if "## Stub — needs full research" in text:
-        return {
-            "ok": False,
-            "why": "page is a stub — use build_article, which writes the whole page",
-            "target": target,
-        }
+
+    # A bare stub belongs to `build`, which writes a whole article rather than
+    # grafting tables onto an empty page. But the marker is not evidence the
+    # page is bare: 9,723 of 12,161 stub-marked pages also carry prose or a
+    # hand-written section, and `build` refuses on exactly those (_handwritten).
+    # Both guards firing is a deadlock — neither tool can touch the page and the
+    # build-out job burns a run writing nothing. Where there is prose to protect,
+    # the marker is the stale half: drop it and graft.
+    stripped_marker = False
+    if _STUB_MARKER in text:
+        without = _strip_stub_marker(text)
+        if _handwritten(without) is None:
+            return {
+                "ok": False,
+                "why": "page is a stub — use build_article, which writes the whole page",
+                "target": target,
+            }
+        text = without
+        stripped_marker = True
 
     fx = facts(conn, folder, name)
     if not fx["resolved"]:
@@ -509,9 +527,17 @@ def append_tables(
         blocks.append((nm, lines))
 
     if not blocks:
+        # Nothing to graft, but a page that already has every generated section
+        # and still carries the marker would stay deadlocked forever: `build`
+        # refuses on its prose and this returns early. Persist the strip.
+        if stripped_marker and not dry_run:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            stubgen._match_dir_owner(path)
         return {
-            "ok": True, "target": target, "written": False,
+            "ok": True, "target": target, "written": stripped_marker and not dry_run,
             "added": [], "skipped_present": skipped,
+            "stub_marker_stripped": stripped_marker,
             "why": "page already has every generated section",
         }
 
@@ -549,6 +575,7 @@ def append_tables(
         "releases_listed": len(rows) if any(nm in ("Releases", "Catalogue") for nm, _ in blocks) else 0,
         "bytes_added": len(insert),
         "queue_items_retired": retired,
+        "stub_marker_stripped": stripped_marker,
     }
 
     if stub_links:
@@ -895,6 +922,19 @@ _GENERATED_HEADINGS = {
     "from discogs", "overview", "releases", "catalogue", "members", "labels",
     "roster", "connections", "research queue", "stub — needs full research",
 }
+
+
+_STUB_MARKER = "## Stub — needs full research"
+
+
+def _strip_stub_marker(text: str) -> str:
+    """Remove the stub-marker heading line, keeping everything else byte for byte.
+
+    14% of stub-marked pages carry content below the marker, so this drops the
+    single heading line rather than truncating from it.
+    """
+    out = [l for l in text.split("\n") if l.strip() != _STUB_MARKER]
+    return "\n".join(out)
 
 
 def _handwritten(text: str) -> Optional[str]:
